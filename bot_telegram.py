@@ -33,6 +33,55 @@ _HABITO_POR_HORARIO = {"10:00": "agua", "15:00": "agua", "18:00": "academia"}
 _LAT = -22.9344
 _LON = -42.5049
 
+# Agenda padrão: 0=seg, 1=ter, 2=qua, 3=qui, 4=sex, 5=sab, 6=dom
+_AGENDA_FIXA = {0: 'A', 1: 'B', 2: 'Descanso', 3: 'C', 4: 'A', 5: 'B', 6: 'Descanso'}
+
+_TREINOS_FIXOS = {
+    'A': [
+        {'grupo': 'Peito',   'exercicio': 'Supino reto com barra',          'series': '4', 'repeticoes': '6-8'},
+        {'grupo': 'Peito',   'exercicio': 'Supino inclinado com halteres',  'series': '3', 'repeticoes': '8-10'},
+        {'grupo': 'Peito',   'exercicio': 'Crossover',                      'series': '3', 'repeticoes': '10-12'},
+        {'grupo': 'Tríceps', 'exercicio': 'Paralelas',                      'series': '3', 'repeticoes': '6-10'},
+        {'grupo': 'Tríceps', 'exercicio': 'Tríceps testa',                  'series': '3', 'repeticoes': '8-10'},
+        {'grupo': 'Tríceps', 'exercicio': 'Tríceps corda no pulley',        'series': '3', 'repeticoes': '10-12'},
+        {'grupo': 'Ombro',   'exercicio': 'Desenvolvimento de ombro',       'series': '3', 'repeticoes': '6-10'},
+        {'grupo': 'Ombro',   'exercicio': 'Elevação lateral',               'series': '3', 'repeticoes': '10-15'},
+    ],
+    'B': [
+        {'grupo': 'Quadríceps',    'exercicio': 'Agachamento livre',          'series': '4', 'repeticoes': '6-8'},
+        {'grupo': 'Quadríceps',    'exercicio': 'Leg press',                  'series': '3', 'repeticoes': '8-12'},
+        {'grupo': 'Quadríceps',    'exercicio': 'Cadeira extensora',          'series': '3', 'repeticoes': '10-12'},
+        {'grupo': 'Posterior',     'exercicio': 'Mesa flexora',               'series': '3', 'repeticoes': '10-12'},
+        {'grupo': 'Posterior',     'exercicio': 'Stiff',                      'series': '3', 'repeticoes': '8-10'},
+        {'grupo': 'Panturrilha',   'exercicio': 'Panturrilha',                'series': '4', 'repeticoes': '12-15'},
+        {'grupo': 'Adutor/Abdutor','exercicio': 'Cadeira abdutora/adutora',   'series': '3', 'repeticoes': '12-15'},
+    ],
+    'C': [
+        {'grupo': 'Costas',  'exercicio': 'Barra fixa',                         'series': '4', 'repeticoes': '6-10'},
+        {'grupo': 'Costas',  'exercicio': 'Puxada na frente',                   'series': '3', 'repeticoes': '8-12'},
+        {'grupo': 'Costas',  'exercicio': 'Remada baixa',                       'series': '3', 'repeticoes': '8-12'},
+        {'grupo': 'Costas',  'exercicio': 'Remada máquina com apoio no peito',  'series': '3', 'repeticoes': '10-12'},
+        {'grupo': 'Costas',  'exercicio': 'Pullover',                           'series': '3', 'repeticoes': '10-12'},
+        {'grupo': 'Bíceps',  'exercicio': 'Rosca direta',                       'series': '3', 'repeticoes': '8-10'},
+        {'grupo': 'Bíceps',  'exercicio': 'Rosca alternada',                    'series': '3', 'repeticoes': '10-12'},
+        {'grupo': 'Bíceps',  'exercicio': 'Rosca martelo',                      'series': '3', 'repeticoes': '10-12'},
+        {'grupo': 'Abdômen', 'exercicio': 'Prancha',                            'series': '3', 'repeticoes': '30-60s'},
+        {'grupo': 'Abdômen', 'exercicio': 'Elevação de pernas',                 'series': '3', 'repeticoes': '12-15'},
+    ],
+}
+
+_NOME_DIA = {
+    'A': 'Dia A — Peito + Tríceps + Ombro',
+    'B': 'Dia B — Pernas + Panturrilha',
+    'C': 'Dia C — Costas + Bíceps + Abdômen',
+}
+
+_ICONE_GRUPO = {
+    'Peito': '🔵', 'Tríceps': '⚫', 'Ombro': '🟠',
+    'Quadríceps': '🟢', 'Posterior': '🟤', 'Panturrilha': '🟡', 'Adutor/Abdutor': '🟣',
+    'Costas': '🔵', 'Bíceps': '🟠', 'Abdômen': '⚫',
+}
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -162,6 +211,50 @@ def buscar_clima():
         return f"{temp:.0f}°C, {desc}{chuva}"
     except Exception:
         return None
+
+
+# ── Treinos ───────────────────────────────────────────────────────────────────
+
+def carregar_treino_dia(dia_letra):
+    if _USA_SB:
+        try:
+            return _sb_req("GET", "treinos", {"dia_letra": f"eq.{dia_letra}", "select": "*", "order": "id"}) or []
+        except Exception:
+            pass
+    return _TREINOS_FIXOS.get(dia_letra, [])
+
+
+def carregar_agenda_treino():
+    if _USA_SB:
+        try:
+            dados = _sb_req("GET", "agenda_treino", {"select": "*"})
+            return {int(d["dia_semana"]): d["dia_letra"] for d in (dados or [])}
+        except Exception:
+            pass
+    return _AGENDA_FIXA
+
+
+def treino_hoje():
+    dia_semana = datetime.now(FUSO).weekday()  # 0=segunda
+    agenda = carregar_agenda_treino()
+    dia_letra = agenda.get(dia_semana, 'Descanso')
+    if dia_letra == 'Descanso':
+        return 'Descanso', []
+    return dia_letra, carregar_treino_dia(dia_letra)
+
+
+def formatar_treino(dia_letra, exercicios):
+    if dia_letra == 'Descanso' or not exercicios:
+        return "😴 Hoje é dia de descanso! Músculo cresce no repouso — aproveita."
+    linhas = [f"💪 *{_NOME_DIA.get(dia_letra, dia_letra)}*\n"]
+    grupo_atual = None
+    for e in exercicios:
+        if e['grupo'] != grupo_atual:
+            grupo_atual = e['grupo']
+            icone = _ICONE_GRUPO.get(grupo_atual, '•')
+            linhas.append(f"\n{icone} *{grupo_atual}*")
+        linhas.append(f"  • {e['exercicio']} — {e['series']}x{e['repeticoes']}")
+    return "\n".join(linhas)
 
 
 # ── Tarefas ───────────────────────────────────────────────────────────────────
@@ -652,6 +745,28 @@ def verificar_lembretes_especificos():
         _deletar_lembrete_especifico(l)
 
 
+def enviar_lembrete_academia():
+    """Lembrete das 18h com o treino do dia incluído."""
+    chat_id = config["telegram"].get("chat_id", "")
+    if not chat_id:
+        return
+    dia_letra, exercicios = treino_hoje()
+    treino_str = formatar_treino(dia_letra, exercicios)
+    mensagem = f"🏋️ *Hora da academia!*\n\n{treino_str}"
+
+    botoes = [telebot.types.InlineKeyboardButton("✅ Fui!", callback_data="habito_academia")]
+    snooze_id = str(int(time.time() * 1000))
+    _snooze_pending[snooze_id] = mensagem
+    botoes.append(telebot.types.InlineKeyboardButton("⏰ +15 min", callback_data=f"snooze_{snooze_id}"))
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(*botoes)
+    try:
+        bot.send_message(chat_id, mensagem, reply_markup=markup, parse_mode="Markdown")
+        print(f"[{datetime.now(FUSO).strftime('%H:%M')}] Lembrete academia enviado")
+    except Exception as e:
+        print(f"Erro lembrete academia: {e}")
+
+
 def configurar_agenda():
     schedule.clear()
 
@@ -661,6 +776,9 @@ def configurar_agenda():
 
     for lembrete in config.get("lembretes", []):
         if lembrete["horario"] in ("07:00",):
+            continue
+        if lembrete["horario"] == "18:00":
+            schedule.every().day.at("18:00").do(enviar_lembrete_academia)
             continue
         habito = _HABITO_POR_HORARIO.get(lembrete["horario"])
         schedule.every().day.at(lembrete["horario"]).do(
@@ -713,6 +831,12 @@ def registrar_handlers():
             "/timer [min] [descrição] — timer rápido\n"
             "/meus\\_lembretes — ver lembretes criados\n"
             "/cancelar\\_lembrete [n] — remover lembrete\n\n"
+            "🏋️ *Academia:*\n"
+            "/treino — treino de hoje\n"
+            "/treino A — ver Dia A (Peito/Tríceps/Ombro)\n"
+            "/treino B — ver Dia B (Pernas)\n"
+            "/treino C — ver Dia C (Costas/Bíceps)\n"
+            "/add\\_exercicio A Peito Supino 4 6-8 — adicionar exercício\n\n"
             "🔍 *Busca:*\n"
             "/buscar [termo] — busca em tarefas e notas\n\n"
             "🏆 *Hábitos:*\n"
@@ -972,6 +1096,50 @@ def registrar_handlers():
                          parse_mode="Markdown")
         except ValueError:
             bot.reply_to(msg, "⚠️ Uso: `/timer 25` ou `/timer 30 Ligar pro cliente`", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["treino"])
+    def cmd_treino(msg):
+        arg = msg.text.replace("/treino", "").strip().upper()
+        if arg in ('A', 'B', 'C'):
+            exercicios = carregar_treino_dia(arg)
+            bot.reply_to(msg, formatar_treino(arg, exercicios), parse_mode="Markdown")
+        else:
+            dia_letra, exercicios = treino_hoje()
+            dias_semana = ['segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado', 'domingo']
+            hoje_nome = dias_semana[datetime.now(FUSO).weekday()]
+            texto = formatar_treino(dia_letra, exercicios)
+            bot.reply_to(msg, f"📅 *{hoje_nome.capitalize()}:*\n{texto}", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["add_exercicio"])
+    def cmd_add_exercicio(msg):
+        partes = msg.text.replace("/add_exercicio", "").strip().split(None, 3)
+        if len(partes) < 4:
+            bot.reply_to(msg,
+                "⚠️ Uso: `/add_exercicio A Peito Supino reto 4 6-8`\n"
+                "Formato: `/add_exercicio [A/B/C] [Grupo] [Exercício] [Séries] [Reps]`",
+                parse_mode="Markdown")
+            return
+        try:
+            dia_letra = partes[0].upper()
+            grupo = partes[1]
+            resto = partes[2].rsplit(None, 2)
+            if len(resto) < 3:
+                raise ValueError
+            exercicio, series, repeticoes = resto
+            if dia_letra not in ('A', 'B', 'C'):
+                raise ValueError
+            novo = {"dia_letra": dia_letra, "grupo": grupo, "exercicio": exercicio,
+                    "series": series, "repeticoes": repeticoes}
+            if _USA_SB:
+                _sb_req("POST", "treinos", body=novo)
+            bot.reply_to(msg,
+                f"✅ Exercício adicionado ao *Dia {dia_letra}*!\n"
+                f"  {grupo} — {exercicio} {series}x{repeticoes}",
+                parse_mode="Markdown")
+        except Exception:
+            bot.reply_to(msg,
+                "⚠️ Formato: `/add_exercicio A Peito Supino reto 4 6-8`",
+                parse_mode="Markdown")
 
     @bot.message_handler(commands=["buscar"])
     def cmd_buscar(msg):
