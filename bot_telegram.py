@@ -24,9 +24,11 @@ def carregar_config():
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         config = json.load(f)
     # Variáveis de ambiente têm prioridade (usado no Railway)
-    token_env = os.environ.get("ORION_TOKEN")
-    if token_env:
-        config["telegram"]["token"] = token_env
+    # Token dividido em 2 partes para contornar limitação do Railway com ":"
+    token_id = os.environ.get("TOKEN_ID")
+    token_key = os.environ.get("TOKEN_KEY")
+    if token_id and token_key:
+        config["telegram"]["token"] = f"{token_id}:{token_key}"
     if os.environ.get("TELEGRAM_CHAT_ID"):
         config["telegram"]["chat_id"] = os.environ["TELEGRAM_CHAT_ID"]
     if os.environ.get("GROQ_API_KEY"):
@@ -235,7 +237,7 @@ def main():
     print("   🤖 ASSISTENTE DE LEMBRETES COM IA (Telegram)")
     print("=" * 54)
 
-    for k in ("ORION_TOKEN", "GROQ_API_KEY", "TELEGRAM_CHAT_ID"):
+    for k in ("TOKEN_ID", "TOKEN_KEY", "GROQ_API_KEY", "TELEGRAM_CHAT_ID"):
         v = os.environ.get(k, "")
         print(f"DEBUG {k}: {'SET('+str(len(v))+' chars)' if v else 'NOT SET'}")
 
