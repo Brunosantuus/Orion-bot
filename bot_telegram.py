@@ -25,9 +25,12 @@ AGUA_LOG_FILE = os.path.join(_base, "agua_log.json")
 
 config = {}
 bot = None
-historico_chat = {}
+historico_chat = {}   # cache em memória: {chat_id: [mensagens]}
 estados = {}
 _snooze_pending = {}
+
+HIST_MAX = 40         # mensagens salvas por conversa no Supabase
+HIST_CONTEXTO = 20    # mensagens enviadas à IA por chamada
 
 _HABITO_POR_HORARIO = {"10:00": "agua", "15:00": "agua", "18:00": "academia"}
 
@@ -127,6 +130,56 @@ def _sb_req(method, table, filters=None, body=None):
         return r.json() if r.content else []
     except Exception:
         return []
+
+
+# ── Histórico de conversa (persistente) ──────────────────────────────────────
+
+def _hist_carregar_db(chat_id):
+    """Carrega histórico do Supabase para o cache em memória."""
+    if not _USA_SB:
+        return []
+    try:
+        dados = _sb_req("GET", "historico_chat", {
+            "chat_id": f"eq.{chat_id}",
+            "select": "role,content",
+            "order": "id.asc",
+            "limit": str(HIST_MAX),
+        })
+        return [{"role": d["role"], "content": d["content"]} for d in (dados or [])]
+    except Exception:
+        return []
+
+
+def _hist_salvar(chat_id, role, content):
+    """Salva mensagem no Supabase e descarta as mais antigas se passar do limite."""
+    if not _USA_SB:
+        return
+    try:
+        _sb_req("POST", "historico_chat", body={
+            "chat_id": str(chat_id),
+            "role": role,
+            "content": content,
+        })
+        # Mantém só as últimas HIST_MAX mensagens
+        todos = _sb_req("GET", "historico_chat", {
+            "chat_id": f"eq.{chat_id}",
+            "select": "id",
+            "order": "id.asc",
+        })
+        if todos and len(todos) > HIST_MAX:
+            for r in todos[:len(todos) - HIST_MAX]:
+                _sb_req("DELETE", "historico_chat", {"id": f"eq.{r['id']}"})
+    except Exception:
+        pass
+
+
+def _hist_limpar_db(chat_id):
+    if not _USA_SB:
+        return
+    try:
+        _sb_req("DELETE", "historico_chat", {"chat_id": f"eq.{chat_id}"})
+    except Exception:
+        pass
 
 
 # ── Helpers de parsing ────────────────────────────────────────────────────────
@@ -721,8 +774,9 @@ def perguntar_ia(chat_id, mensagem_usuario):
     if not api_key or "SUA_KEY" in api_key:
         return "⚠️ Configure a chave do Groq no config.json"
 
+    # Carrega do Supabase se não estiver em memória (ex: após restart)
     if chat_id not in historico_chat:
-        historico_chat[chat_id] = []
+        historico_chat[chat_id] = _hist_carregar_db(chat_id)
 
     agora = datetime.now(FUSO).strftime("%Y-%m-%d %H:%M")
     dia_letra, exercicios_hoje = treino_hoje()
@@ -751,11 +805,14 @@ def perguntar_ia(chat_id, mensagem_usuario):
     )
 
     historico_chat[chat_id].append({"role": "user", "content": mensagem_usuario})
-    mensagens = historico_chat[chat_id][-12:]
+    _hist_salvar(chat_id, "user", mensagem_usuario)
+
+    mensagens = historico_chat[chat_id][-HIST_CONTEXTO:]
 
     try:
         resposta = _chamar_groq([{"role": "system", "content": system_prompt}] + mensagens)
         historico_chat[chat_id].append({"role": "assistant", "content": resposta})
+        _hist_salvar(chat_id, "assistant", resposta)
         return resposta
     except requests.exceptions.Timeout:
         return "⏳ A IA demorou demais. Tente novamente."
@@ -1419,6 +1476,13 @@ def registrar_handlers():
             f"→ *{meta}L por dia* (~{copos} copos de 200ml)\n\n"
             f"_Fórmula: 35ml × peso corporal_",
             parse_mode="Markdown")
+
+    @bot.message_handler(commands=["limpar_historico"])
+    def cmd_limpar_historico(msg):
+        chat_id = msg.chat.id
+        historico_chat.pop(chat_id, None)
+        _hist_limpar_db(chat_id)
+        bot.reply_to(msg, "🧹 Histórico de conversa limpo!\nComeçamos do zero.")
 
     @bot.message_handler(commands=["bebi"])
     def cmd_bebi(msg):
