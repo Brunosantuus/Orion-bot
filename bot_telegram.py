@@ -19,14 +19,14 @@ CONFIG_FILE = (os.path.join(_base, "config.json")
 TAREFAS_FILE = os.path.join(_base, "tarefas.json")
 LEMBRETES_USUARIO_FILE = os.path.join(_base, "lembretes_usuario.json")
 STREAKS_FILE = os.path.join(_base, "streaks.json")
+NOTAS_FILE = os.path.join(_base, "notas.json")
 
 config = {}
 bot = None
 historico_chat = {}
 estados = {}
-_snooze_pending = {}  # snooze_id -> texto do lembrete
+_snooze_pending = {}
 
-# Hábitos monitorados por horário fixo
 _HABITO_POR_HORARIO = {"10:00": "agua", "15:00": "agua", "18:00": "academia"}
 
 
@@ -74,6 +74,50 @@ def _sb_req(method, table, filters=None, body=None):
         return []
 
 
+# ── Helpers de parsing ────────────────────────────────────────────────────────
+
+def _parse_tarefa(texto):
+    """Extrai prioridade (!urgente) e prazo (@DD/MM) do texto."""
+    prioridade = "normal"
+    prazo = None
+
+    if texto.startswith("!") or re.search(r"\burgente\b", texto, re.IGNORECASE):
+        prioridade = "alta"
+        texto = re.sub(r"^!+\s*", "", texto)
+        texto = re.sub(r"\burgente:?\s*", "", texto, flags=re.IGNORECASE).strip()
+
+    match = re.search(r"@(\d{1,2})/(\d{1,2})(?:/(\d{4}))?", texto)
+    if match:
+        try:
+            dia = int(match.group(1))
+            mes = int(match.group(2))
+            ano = int(match.group(3)) if match.group(3) else date.today().year
+            prazo = date(ano, mes, dia).isoformat()
+        except ValueError:
+            pass
+        texto = re.sub(r"@\d{1,2}/\d{1,2}(?:/\d{4})?", "", texto).strip()
+
+    return texto, prioridade, prazo
+
+
+def _prazo_label(prazo_iso):
+    """Retorna label legível do prazo com urgência."""
+    if not prazo_iso:
+        return ""
+    try:
+        prazo_dt = date.fromisoformat(prazo_iso)
+        dias = (prazo_dt - date.today()).days
+        if dias < 0:
+            return " ⚠️ VENCIDA"
+        if dias == 0:
+            return " 🚨 HOJE"
+        if dias == 1:
+            return " ⏳ amanhã"
+        return f" 📅 {prazo_dt.strftime('%d/%m')}"
+    except Exception:
+        return ""
+
+
 # ── Tarefas ───────────────────────────────────────────────────────────────────
 
 def carregar_tarefas():
@@ -93,8 +137,14 @@ def _tarefas_local_save(lst):
         json.dump(lst, f, ensure_ascii=False, indent=2)
 
 
-def adicionar_tarefa(texto):
-    nova = {"texto": texto, "concluida": False, "criada": date.today().isoformat()}
+def adicionar_tarefa(texto, prioridade="normal", prazo=None):
+    nova = {
+        "texto": texto,
+        "concluida": False,
+        "criada": date.today().isoformat(),
+        "prioridade": prioridade,
+        "prazo": prazo,
+    }
     if _USA_SB:
         try:
             _sb_req("POST", "tarefas", body=nova)
@@ -148,14 +198,83 @@ def limpar_concluidas():
     return len(concluidas)
 
 
-def formatar_tarefas():
+def formatar_tarefas(apenas_pendentes=False):
     tarefas = carregar_tarefas()
+    if apenas_pendentes:
+        tarefas = [t for t in tarefas if not t.get("concluida")]
+
+    _ordem = {"alta": 0, "normal": 1, "baixa": 2}
+    tarefas = sorted(
+        tarefas,
+        key=lambda t: (
+            t.get("concluida", False),
+            _ordem.get(t.get("prioridade", "normal"), 1),
+            t.get("prazo") or "z",
+        ),
+    )
+
     if not tarefas:
         return "Nenhuma tarefa cadastrada."
-    return "\n".join(
-        f"{i}. {'✅' if t.get('concluida') else '⬜'} {t['texto']}"
-        for i, t in enumerate(tarefas, 1)
-    )
+
+    linhas = []
+    for i, t in enumerate(tarefas, 1):
+        if t.get("concluida"):
+            icone = "✅"
+        elif t.get("prioridade") == "alta":
+            icone = "🔴"
+        elif t.get("prioridade") == "baixa":
+            icone = "🟢"
+        else:
+            icone = "⬜"
+        prazo = _prazo_label(t.get("prazo")) if not t.get("concluida") else ""
+        linhas.append(f"{i}. {icone} {t['texto']}{prazo}")
+    return "\n".join(linhas)
+
+
+# ── Notas rápidas ─────────────────────────────────────────────────────────────
+
+def carregar_notas():
+    if _USA_SB:
+        try:
+            return _sb_req("GET", "notas", {"select": "*", "order": "id"}) or []
+        except Exception:
+            pass
+    if os.path.exists(NOTAS_FILE):
+        with open(NOTAS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def _notas_local_save(lst):
+    with open(NOTAS_FILE, "w", encoding="utf-8") as f:
+        json.dump(lst, f, ensure_ascii=False, indent=2)
+
+
+def adicionar_nota(texto):
+    nova = {"texto": texto, "criada": datetime.now(FUSO).strftime("%Y-%m-%d %H:%M")}
+    if _USA_SB:
+        try:
+            _sb_req("POST", "notas", body=nova)
+            return
+        except Exception:
+            pass
+    lst = carregar_notas()
+    lst.append(nova)
+    _notas_local_save(lst)
+
+
+def remover_nota(idx):
+    lst = carregar_notas()
+    n = lst[idx - 1]
+    if _USA_SB:
+        try:
+            _sb_req("DELETE", "notas", {"id": f"eq.{n['id']}"})
+            return n
+        except Exception:
+            pass
+    lst.pop(idx - 1)
+    _notas_local_save(lst)
+    return n
 
 
 # ── Lembretes do usuário ──────────────────────────────────────────────────────
@@ -219,7 +338,7 @@ def _deletar_lembrete_especifico(l):
     _lembretes_local_save(lst)
 
 
-# ── Streaks de hábitos ────────────────────────────────────────────────────────
+# ── Streaks ───────────────────────────────────────────────────────────────────
 
 def carregar_streaks():
     if _USA_SB:
@@ -240,7 +359,6 @@ def _streaks_local_save(streaks):
 
 
 def confirmar_habito(habito):
-    """Registra confirmação do hábito. Retorna (sequencia, msg) ou (seq, None) se já confirmado hoje."""
     hoje = date.today().isoformat()
     ontem = (date.today() - timedelta(days=1)).isoformat()
     streaks = carregar_streaks()
@@ -331,6 +449,78 @@ def perguntar_ia(chat_id, mensagem_usuario):
         return f"⚠️ Erro ao consultar IA: {str(e)}"
 
 
+# ── Alertas e automações ──────────────────────────────────────────────────────
+
+def verificar_prazos():
+    """Envia alerta de tarefas vencendo em até 2 dias. Chamado às 08:05."""
+    chat_id = config["telegram"].get("chat_id", "")
+    if not chat_id:
+        return
+
+    hoje = date.today()
+    alertas = []
+    for t in carregar_tarefas():
+        if t.get("concluida") or not t.get("prazo"):
+            continue
+        try:
+            prazo_dt = date.fromisoformat(t["prazo"])
+            dias = (prazo_dt - hoje).days
+            if dias < 0:
+                alertas.append(f"⚠️ *VENCIDA:* {t['texto']} (venceu {prazo_dt.strftime('%d/%m')})")
+            elif dias == 0:
+                alertas.append(f"🚨 *HOJE:* {t['texto']}")
+            elif dias == 1:
+                alertas.append(f"⏳ *Amanhã:* {t['texto']}")
+            elif dias == 2:
+                alertas.append(f"📅 *Em 2 dias:* {t['texto']}")
+        except Exception:
+            continue
+
+    if alertas:
+        try:
+            bot.send_message(chat_id, "🔔 *Atenção aos prazos:*\n\n" + "\n".join(alertas), parse_mode="Markdown")
+        except Exception as e:
+            print(f"Erro alerta prazos: {e}")
+
+
+def enviar_resumo_semanal():
+    """Resumo gerado pela IA toda sexta às 17h."""
+    if datetime.now(FUSO).weekday() != 4:  # 4 = sexta-feira
+        return
+
+    chat_id = config["telegram"].get("chat_id", "")
+    if not chat_id:
+        return
+
+    tarefas = carregar_tarefas()
+    concluidas = [t for t in tarefas if t.get("concluida")]
+    pendentes = [t for t in tarefas if not t.get("concluida")]
+
+    try:
+        nomes_c = ", ".join(t["texto"] for t in concluidas[:5]) or "nenhuma"
+        nomes_p = ", ".join(t["texto"] for t in pendentes[:5]) or "nenhuma"
+        prompt = (
+            f"Você é o Orion. É sexta-feira, hora do resumo semanal do Bruno. "
+            f"Concluídas: {len(concluidas)} ({nomes_c}). "
+            f"Pendentes: {len(pendentes)} ({nomes_p}). "
+            f"Gere um resumo animado em até 5 linhas: reconheça as conquistas, "
+            f"destaque o que ficou pendente e motive para a próxima semana."
+        )
+        mensagem = _chamar_groq([{"role": "user", "content": prompt}], max_tokens=250)
+    except Exception:
+        mensagem = (
+            f"📊 *Resumo da semana:*\n"
+            f"✅ {len(concluidas)} tarefa(s) concluída(s)\n"
+            f"⬜ {len(pendentes)} pendente(s)\n\n"
+            "Bom fim de semana! 🎉"
+        )
+
+    try:
+        bot.send_message(chat_id, mensagem, parse_mode="Markdown")
+    except Exception as e:
+        print(f"Erro resumo semanal: {e}")
+
+
 # ── Lembretes agendados ───────────────────────────────────────────────────────
 
 def enviar_lembrete(mensagem, habito=None):
@@ -339,13 +529,11 @@ def enviar_lembrete(mensagem, habito=None):
         return
     try:
         botoes = []
-
         if habito == "academia":
             botoes.append(telebot.types.InlineKeyboardButton("✅ Fui!", callback_data="habito_academia"))
         elif habito == "agua":
             botoes.append(telebot.types.InlineKeyboardButton("💧 Bebi!", callback_data="habito_agua"))
 
-        # Limpa entradas antigas para não vazar memória
         if len(_snooze_pending) > 50:
             for k in sorted(_snooze_pending.keys())[:25]:
                 del _snooze_pending[k]
@@ -363,14 +551,13 @@ def enviar_lembrete(mensagem, habito=None):
 
 
 def enviar_agenda_manha():
-    """Bom dia personalizado gerado pela IA com as tarefas e lembretes do dia."""
+    """Bom dia personalizado com agenda do dia gerado pela IA."""
     chat_id = config["telegram"].get("chat_id", "")
     if not chat_id:
         return
 
-    api_key = config.get("groq", {}).get("api_key", "")
     hoje = datetime.now(FUSO).strftime("%Y-%m-%d")
-    tarefas = formatar_tarefas()
+    tarefas = formatar_tarefas(apenas_pendentes=True)
     lembretes_hoje = [
         l for l in carregar_lembretes_usuario()
         if l["tipo"] == "especifico" and l.get("datetime", "").startswith(hoje)
@@ -382,13 +569,12 @@ def enviar_agenda_manha():
             f"Você é o Orion, assistente do Bruno. É manhã de {hoje}. "
             f"Mande um bom dia animado e mostre a agenda do dia em até 4 linhas. "
             f"Tarefas pendentes: {tarefas}. Lembretes de hoje: {lista_lem}. "
-            f"Não use [LEMBRETE:...]. Seja direto e motivador."
+            f"Destaque tarefas urgentes (🔴) se houver. Não use [LEMBRETE:...]. Seja direto e motivador."
         )
         mensagem = _chamar_groq([{"role": "user", "content": prompt}], max_tokens=200)
     except Exception:
         mensagem = config.get("lembretes", [{}])[0].get(
-            "mensagem",
-            "Bom dia! ☀️\n💧 Beba água\n📋 Use /tarefas para ver o dia"
+            "mensagem", "Bom dia! ☀️\n💧 Beba água\n📋 Use /tarefas para ver o dia"
         )
 
     try:
@@ -416,19 +602,18 @@ def verificar_lembretes_especificos():
 def configurar_agenda():
     schedule.clear()
 
-    # Lembrete das 7h: agenda personalizada pela IA
     schedule.every().day.at("07:00").do(enviar_agenda_manha)
+    schedule.every().day.at("08:05").do(verificar_prazos)
+    schedule.every().day.at("17:00").do(enviar_resumo_semanal)
 
-    # Demais lembretes fixos com botões de hábito onde aplicável
     for lembrete in config.get("lembretes", []):
-        if lembrete["horario"] == "07:00":
+        if lembrete["horario"] in ("07:00",):
             continue
         habito = _HABITO_POR_HORARIO.get(lembrete["horario"])
         schedule.every().day.at(lembrete["horario"]).do(
             enviar_lembrete, mensagem=lembrete["mensagem"], habito=habito
         )
 
-    # Lembretes diários criados pelo usuário
     for l in carregar_lembretes_usuario():
         if l["tipo"] == "diario":
             schedule.every().day.at(l["hora"]).do(enviar_lembrete, mensagem=f"⏰ {l['texto']}")
@@ -459,18 +644,28 @@ def registrar_handlers():
         bot.reply_to(msg, (
             f"{extra}"
             "🌟 *Orion — Assistente Pessoal*\n\n"
-            "📋 *Comandos:*\n"
+            "📋 *Tarefas:*\n"
+            "/adicionar [texto] [@DD/MM] — adicionar (use ! para urgente)\n"
+            "/urgente [texto] — adicionar tarefa urgente\n"
+            "/tarefas — ver tarefas (ordenadas por prioridade)\n"
+            "/concluir [n] — marcar como feita\n"
+            "/remover [n] — remover\n"
+            "/historico — ver tarefas concluídas\n\n"
+            "📝 *Notas rápidas:*\n"
+            "/nota [texto] — salvar nota\n"
+            "/notas — ver todas as notas\n"
+            "/deletar\\_nota [n] — remover nota\n\n"
+            "⏰ *Lembretes:*\n"
             "/lembrar [texto] — criar lembrete\n"
             "/meus\\_lembretes — ver lembretes criados\n"
-            "/cancelar\\_lembrete [n] — remover lembrete\n"
-            "/tarefas — ver lista de tarefas\n"
-            "/adicionar [tarefa] — adicionar tarefa\n"
-            "/concluir [n] — marcar tarefa como feita\n"
-            "/remover [n] — remover tarefa\n"
-            "/streaks — ver sequência de hábitos\n"
-            "/lembretes — ver lembretes fixos\n\n"
-            "💬 *Ou mande uma mensagem — o Orion responde!*"
+            "/cancelar\\_lembrete [n] — remover lembrete\n\n"
+            "🏆 *Hábitos:*\n"
+            "/streaks — ver sequência de hábitos\n\n"
+            "💬 *Ou mande uma mensagem — o Orion responde!*\n"
+            "_Ex: 'me lembra da reunião amanhã às 14h'_"
         ), parse_mode="Markdown")
+
+    # ── Tarefas ──
 
     @bot.message_handler(commands=["tarefas"])
     def cmd_tarefas(msg):
@@ -478,12 +673,30 @@ def registrar_handlers():
 
     @bot.message_handler(commands=["adicionar"])
     def cmd_adicionar(msg):
-        texto = msg.text.replace("/adicionar", "").strip()
-        if not texto:
-            bot.reply_to(msg, "⚠️ Uso: `/adicionar Descrição da tarefa`", parse_mode="Markdown")
+        texto_raw = msg.text.replace("/adicionar", "").strip()
+        if not texto_raw:
+            bot.reply_to(msg,
+                         "⚠️ Uso: `/adicionar texto [@DD/MM]`\n"
+                         "Use `!` no início para urgente.\n"
+                         "Ex: `/adicionar ! Relatório @30/06`",
+                         parse_mode="Markdown")
             return
-        adicionar_tarefa(texto)
-        bot.reply_to(msg, f"✅ Tarefa adicionada:\n*{texto}*", parse_mode="Markdown")
+        texto, prioridade, prazo = _parse_tarefa(texto_raw)
+        adicionar_tarefa(texto, prioridade, prazo)
+        prazo_str = f"\n📅 Prazo: {date.fromisoformat(prazo).strftime('%d/%m/%Y')}" if prazo else ""
+        prioridade_str = " 🔴 *URGENTE*" if prioridade == "alta" else ""
+        bot.reply_to(msg, f"✅ Tarefa adicionada:{prioridade_str}\n*{texto}*{prazo_str}", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["urgente"])
+    def cmd_urgente(msg):
+        texto_raw = msg.text.replace("/urgente", "").strip()
+        if not texto_raw:
+            bot.reply_to(msg, "⚠️ Uso: `/urgente Descrição da tarefa`", parse_mode="Markdown")
+            return
+        texto, _, prazo = _parse_tarefa(texto_raw)
+        adicionar_tarefa(texto, prioridade="alta", prazo=prazo)
+        prazo_str = f"\n📅 Prazo: {date.fromisoformat(prazo).strftime('%d/%m/%Y')}" if prazo else ""
+        bot.reply_to(msg, f"🔴 *Tarefa urgente adicionada:*\n{texto}{prazo_str}", parse_mode="Markdown")
 
     @bot.message_handler(commands=["concluir"])
     def cmd_concluir(msg):
@@ -508,6 +721,47 @@ def registrar_handlers():
         n = limpar_concluidas()
         bot.reply_to(msg, f"🧹 {n} tarefa(s) concluída(s) removida(s).")
 
+    @bot.message_handler(commands=["historico"])
+    def cmd_historico(msg):
+        concluidas = [t for t in carregar_tarefas() if t.get("concluida")]
+        if not concluidas:
+            bot.reply_to(msg, "Nenhuma tarefa concluída ainda. Bora trabalhar! 💪")
+            return
+        linhas = [f"{i}. ✅ {t['texto']}" for i, t in enumerate(concluidas, 1)]
+        bot.reply_to(msg, "✅ *Tarefas concluídas:*\n\n" + "\n".join(linhas), parse_mode="Markdown")
+
+    # ── Notas ──
+
+    @bot.message_handler(commands=["nota"])
+    def cmd_nota(msg):
+        texto = msg.text.replace("/nota", "").strip()
+        if not texto:
+            bot.reply_to(msg, "⚠️ Uso: `/nota Texto da nota`\nEx: `/nota Protocolo 2024/001 - aguardando sec`", parse_mode="Markdown")
+            return
+        adicionar_nota(texto)
+        bot.reply_to(msg, f"📝 Nota salva:\n_{texto}_", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["notas"])
+    def cmd_notas(msg):
+        notas = carregar_notas()
+        if not notas:
+            bot.reply_to(msg, "Nenhuma nota salva.\nUse `/nota texto` para adicionar.", parse_mode="Markdown")
+            return
+        linhas = [f"{i}. 📝 {n['texto']}" for i, n in enumerate(notas, 1)]
+        bot.reply_to(msg, "📝 *Suas notas:*\n\n" + "\n".join(linhas) +
+                     "\n\nUse `/deletar_nota [número]` para remover.", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["deletar_nota"])
+    def cmd_deletar_nota(msg):
+        try:
+            n = int(msg.text.replace("/deletar_nota", "").strip())
+            nota = remover_nota(n)
+            bot.reply_to(msg, f"🗑️ Nota removida: _{nota['texto']}_", parse_mode="Markdown")
+        except (ValueError, IndexError):
+            bot.reply_to(msg, "⚠️ Uso: `/deletar_nota 1` (número da nota)", parse_mode="Markdown")
+
+    # ── Streaks ──
+
     @bot.message_handler(commands=["streaks"])
     def cmd_streaks(msg):
         streaks = carregar_streaks()
@@ -526,6 +780,8 @@ def registrar_handlers():
             emoji = "🔥" if seq >= 3 else ("✅" if seq > 0 else "⬜")
             linhas.append(f"{emoji} {nome}: *{seq} dia(s) seguido(s)*")
         bot.reply_to(msg, "🏆 *Seus hábitos:*\n\n" + "\n".join(linhas), parse_mode="Markdown")
+
+    # ── Lembretes ──
 
     @bot.message_handler(commands=["lembrar"])
     def cmd_lembrar(msg):
@@ -573,7 +829,7 @@ def registrar_handlers():
             bot.answer_callback_query(call.id, "⚠️ Lembrete expirado.")
             return
         dt_snooze = datetime.now(FUSO) + timedelta(minutes=15)
-        texto = re.sub(r'^⏰\s*', '', mensagem).strip()
+        texto = re.sub(r"^⏰\s*", "", mensagem).strip()
         adicionar_lembrete_usuario({
             "tipo": "especifico",
             "texto": texto,
@@ -584,7 +840,9 @@ def registrar_handlers():
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         except Exception:
             pass
-        bot.send_message(call.message.chat.id, f"⏰ Ok! Vou te lembrar às *{dt_snooze.strftime('%H:%M')}*.", parse_mode="Markdown")
+        bot.send_message(call.message.chat.id,
+                         f"⏰ Ok! Vou te lembrar às *{dt_snooze.strftime('%H:%M')}*.",
+                         parse_mode="Markdown")
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("habito_"))
     def callback_habito(call):
@@ -638,6 +896,8 @@ def registrar_handlers():
         linhas = [f"⏰ `{l['horario']}` — {l['mensagem'].splitlines()[0]}" for l in lembretes]
         bot.reply_to(msg, "📅 *Lembretes fixos:*\n\n" + "\n".join(linhas), parse_mode="Markdown")
 
+    # ── Chat livre ──
+
     @bot.message_handler(func=lambda m: True, content_types=["text"])
     def handle_texto(msg):
         chat_id = msg.chat.id
@@ -666,7 +926,7 @@ def registrar_handlers():
                              parse_mode="Markdown")
             except Exception:
                 bot.reply_to(msg,
-                             "⚠️ Formato inválido. Use: `DD/MM HH:MM` ou `hoje HH:MM`\nExemplo: `hoje 15:30`",
+                             "⚠️ Formato inválido. Use: `DD/MM HH:MM` ou `hoje HH:MM`",
                              parse_mode="Markdown")
 
         elif estado.get("step") == "hora":
@@ -681,7 +941,7 @@ def registrar_handlers():
                              f"✅ Lembrete diário criado!\n🔁 *Todo dia às {hora_str}*\n📝 {estado['texto']}",
                              parse_mode="Markdown")
             except Exception:
-                bot.reply_to(msg, "⚠️ Formato inválido. Use: `HH:MM`\nExemplo: `08:30`", parse_mode="Markdown")
+                bot.reply_to(msg, "⚠️ Formato inválido. Use: `HH:MM`", parse_mode="Markdown")
 
         else:
             bot.send_chat_action(chat_id, "typing")
@@ -725,7 +985,7 @@ def main():
         print("\n⚠️  GROQ_API_KEY não configurada.")
 
     if _USA_SB:
-        print("\n✅ Persistência: Supabase (dados salvos permanentemente)")
+        print("\n✅ Persistência: Supabase")
     else:
         print("\n⚠️  Persistência: arquivos locais (dados perdidos ao reiniciar)")
 
