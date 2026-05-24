@@ -237,10 +237,6 @@ def main():
     print("   🤖 ASSISTENTE DE LEMBRETES COM IA (Telegram)")
     print("=" * 54)
 
-    for k in ("TOKEN_ID", "TOKEN_KEY", "GROQ_API_KEY", "TELEGRAM_CHAT_ID"):
-        v = os.environ.get(k, "")
-        print(f"DEBUG {k}: {'SET('+str(len(v))+' chars)' if v else 'NOT SET'}")
-
     carregar_config()
 
     token = config["telegram"].get("token", "")
