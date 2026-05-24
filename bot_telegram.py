@@ -20,6 +20,7 @@ TAREFAS_FILE = os.path.join(_base, "tarefas.json")
 LEMBRETES_USUARIO_FILE = os.path.join(_base, "lembretes_usuario.json")
 STREAKS_FILE = os.path.join(_base, "streaks.json")
 NOTAS_FILE = os.path.join(_base, "notas.json")
+PESO_FILE = os.path.join(_base, "peso_historico.json")
 
 config = {}
 bot = None
@@ -211,6 +212,85 @@ def buscar_clima():
         return f"{temp:.0f}°C, {desc}{chuva}"
     except Exception:
         return None
+
+
+# ── Peso e saúde ─────────────────────────────────────────────────────────────
+
+def carregar_historico_peso():
+    if _USA_SB:
+        try:
+            return _sb_req("GET", "peso_historico", {"select": "*", "order": "data.asc"}) or []
+        except Exception:
+            pass
+    if os.path.exists(PESO_FILE):
+        with open(PESO_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def _peso_local_save(lst):
+    with open(PESO_FILE, "w", encoding="utf-8") as f:
+        json.dump(lst, f, ensure_ascii=False, indent=2)
+
+
+def registrar_peso(peso, observacao=None):
+    novo = {"peso": peso, "data": date.today().isoformat(), "observacao": observacao}
+    if _USA_SB:
+        try:
+            _sb_req("POST", "peso_historico", body=novo)
+            return
+        except Exception:
+            pass
+    lst = carregar_historico_peso()
+    lst.append(novo)
+    _peso_local_save(lst)
+
+
+def peso_atual():
+    historico = carregar_historico_peso()
+    return float(historico[-1]["peso"]) if historico else None
+
+
+def calcular_meta_agua(peso_kg):
+    """35ml por kg de peso corporal."""
+    return round(peso_kg * 0.035, 1)
+
+
+def tendencia_peso(historico, n=5):
+    """Retorna string com tendência de peso nos últimos n registros."""
+    if len(historico) < 2:
+        return None
+    recentes = historico[-n:]
+    primeiro = float(recentes[0]["peso"])
+    ultimo = float(recentes[-1]["peso"])
+    diff = round(ultimo - primeiro, 1)
+    if diff > 0.2:
+        return f"↑ +{diff}kg"
+    elif diff < -0.2:
+        return f"↓ {diff}kg"
+    return "→ estável"
+
+
+def _contexto_saude():
+    """Resumo de saúde para enriquecer o system prompt da IA."""
+    partes = []
+    historico = carregar_historico_peso()
+    if historico:
+        p = float(historico[-1]["peso"])
+        meta = calcular_meta_agua(p)
+        tend = tendencia_peso(historico)
+        partes.append(f"Peso: {p}kg{(' (' + tend + ')') if tend else ''}")
+        partes.append(f"Meta de água: {meta}L/dia ({int(meta/0.2)} copos de 200ml)")
+    dia_letra, _ = treino_hoje()
+    if dia_letra != 'Descanso':
+        partes.append(f"Treino hoje: {_NOME_DIA.get(dia_letra, dia_letra)}")
+    else:
+        partes.append("Hoje é dia de descanso")
+    streaks = carregar_streaks()
+    s = streaks.get("academia", {}).get("sequencia", 0)
+    if s:
+        partes.append(f"Sequência academia: {s} dias")
+    return "\n".join(partes)
 
 
 # ── Treinos ───────────────────────────────────────────────────────────────────
@@ -558,22 +638,28 @@ def perguntar_ia(chat_id, mensagem_usuario):
         historico_chat[chat_id] = []
 
     agora = datetime.now(FUSO).strftime("%Y-%m-%d %H:%M")
+    dia_letra, exercicios_hoje = treino_hoje()
+    treino_ctx = formatar_treino(dia_letra, exercicios_hoje) if dia_letra != 'Descanso' else "Hoje é dia de descanso."
     system_prompt = (
         "Você é o Orion, assistente pessoal do Bruno — criado por ele e totalmente dedicado a deixar a vida dele mais fácil. "
         "Você conhece o Bruno bem: trabalha na prefeitura de Saquarema, academia é prioridade, e às vezes esquece de beber água (não que você vá deixar barato).\n\n"
         "Personalidade: você é aquele amigo engraçado do grupo — faz piada, usa gíria brasileira, é sarcástico na medida certa, mas quando precisa fazer, faz rápido. "
         "Celebra quando o Bruno faz algo bom. Zoa levemente quando ele esquece as coisas. Nunca é robótico.\n\n"
+        "Você também é um personal trainer informal — conhece o treino do Bruno e pode sugerir substituições de exercícios, "
+        "progressão de carga, dicas de execução e ajustes baseados em dores ou limitações que ele mencionar.\n\n"
         "Regras:\n"
-        "- Respostas CURTAS — máximo 2-3 linhas, sem textão\n"
+        "- Respostas CURTAS — máximo 3 linhas, sem textão\n"
         "- Executa primeiro, comenta depois\n"
         "- Sem 'Olá!' no início, sem formalidade\n"
-        "- Emojis com moderação, só quando fizer sentido\n\n"
-        f"Agora são {agora}. Tarefas do Bruno:\n{formatar_tarefas()}\n\n"
+        "- Emojis com moderação\n\n"
+        f"Agora são {agora}.\n"
+        f"Saúde do Bruno:\n{_contexto_saude()}\n\n"
+        f"Tarefas:\n{formatar_tarefas()}\n\n"
+        f"Treino de hoje:\n{treino_ctx}\n\n"
         "REGRA OBRIGATÓRIA: sempre que o Bruno pedir pra lembrar, notificar ou agendar QUALQUER coisa, "
         "coloque EXATAMENTE esta linha no início da resposta (sem espaços extras):\n"
         "[LEMBRETE:YYYY-MM-DD HH:MM:descrição]\n"
         "Use a data/hora atual para calcular horários relativos. "
-        "Exemplos: 'daqui 1 minuto' → soma 1 min na hora atual. 'amanhã às 9h' → data de amanhã 09:00. "
         "NUNCA omita essa linha quando houver pedido de lembrete."
     )
 
@@ -745,6 +831,18 @@ def verificar_lembretes_especificos():
         _deletar_lembrete_especifico(l)
 
 
+def enviar_lembrete_agua(mensagem_base):
+    """Lembrete de água com meta personalizada por peso."""
+    p = peso_atual()
+    if p:
+        meta = calcular_meta_agua(p)
+        copos = int(meta / 0.2)
+        mensagem = f"{mensagem_base}\n💧 Meta do dia: {meta}L (~{copos} copos)"
+    else:
+        mensagem = mensagem_base
+    enviar_lembrete(mensagem, habito="agua")
+
+
 def enviar_lembrete_academia():
     """Lembrete das 18h com o treino do dia incluído."""
     chat_id = config["telegram"].get("chat_id", "")
@@ -779,6 +877,11 @@ def configurar_agenda():
             continue
         if lembrete["horario"] == "18:00":
             schedule.every().day.at("18:00").do(enviar_lembrete_academia)
+            continue
+        if lembrete["horario"] in ("10:00", "15:00"):
+            schedule.every().day.at(lembrete["horario"]).do(
+                enviar_lembrete_agua, mensagem_base=lembrete["mensagem"]
+            )
             continue
         habito = _HABITO_POR_HORARIO.get(lembrete["horario"])
         schedule.every().day.at(lembrete["horario"]).do(
@@ -831,6 +934,12 @@ def registrar_handlers():
             "/timer [min] [descrição] — timer rápido\n"
             "/meus\\_lembretes — ver lembretes criados\n"
             "/cancelar\\_lembrete [n] — remover lembrete\n\n"
+            "💪 *Saúde:*\n"
+            "/peso 80.5 — registrar peso\n"
+            "/historico\\_peso — histórico de peso com tendência\n"
+            "/meta\\_agua — ver meta de água pelo seu peso\n"
+            "/stats — dashboard completo (peso, treino, hábitos, tarefas)\n"
+            "/dicas — dicas personalizadas da IA\n\n"
             "🏋️ *Academia:*\n"
             "/treino — treino de hoje\n"
             "/treino A — ver Dia A (Peito/Tríceps/Ombro)\n"
@@ -1096,6 +1205,127 @@ def registrar_handlers():
                          parse_mode="Markdown")
         except ValueError:
             bot.reply_to(msg, "⚠️ Uso: `/timer 25` ou `/timer 30 Ligar pro cliente`", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["peso"])
+    def cmd_peso(msg):
+        partes = msg.text.replace("/peso", "").strip().split(None, 1)
+        if not partes:
+            bot.reply_to(msg, "⚠️ Uso: `/peso 80.5` ou `/peso 80.5 pós-treino`", parse_mode="Markdown")
+            return
+        try:
+            p = float(partes[0].replace(",", "."))
+            obs = partes[1] if len(partes) > 1 else None
+            registrar_peso(p, obs)
+            meta = calcular_meta_agua(p)
+            copos = int(meta / 0.2)
+            historico = carregar_historico_peso()
+            tend = tendencia_peso(historico)
+            tend_str = f" ({tend})" if tend else ""
+            bot.reply_to(msg,
+                f"⚖️ *{p}kg registrado!*{tend_str}\n"
+                f"💧 Sua meta de água: *{meta}L/dia* (~{copos} copos)",
+                parse_mode="Markdown")
+        except ValueError:
+            bot.reply_to(msg, "⚠️ Uso: `/peso 80.5`", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["historico_peso"])
+    def cmd_historico_peso(msg):
+        historico = carregar_historico_peso()
+        if not historico:
+            bot.reply_to(msg, "Nenhum peso registrado ainda.\nUse `/peso 80.5` para começar.", parse_mode="Markdown")
+            return
+        recentes = historico[-10:]
+        linhas = ["📈 *Histórico de peso:*\n"]
+        for r in recentes:
+            data_fmt = datetime.strptime(r["data"], "%Y-%m-%d").strftime("%d/%m")
+            obs = f" — _{r['observacao']}_" if r.get("observacao") else ""
+            linhas.append(f"  `{data_fmt}` {r['peso']}kg{obs}")
+        tend = tendencia_peso(historico)
+        if tend:
+            linhas.append(f"\nTendência: *{tend}*")
+        bot.reply_to(msg, "\n".join(linhas), parse_mode="Markdown")
+
+    @bot.message_handler(commands=["stats"])
+    def cmd_stats(msg):
+        historico = carregar_historico_peso()
+        streaks = carregar_streaks()
+        tarefas = carregar_tarefas()
+        hoje = date.today().isoformat()
+
+        linhas = ["📊 *Suas estatísticas:*\n"]
+
+        # Peso
+        if historico:
+            p = float(historico[-1]["peso"])
+            tend = tendencia_peso(historico)
+            tend_str = f" ({tend})" if tend else ""
+            meta = calcular_meta_agua(p)
+            linhas.append(f"⚖️ Peso: *{p}kg*{tend_str}")
+            linhas.append(f"💧 Meta de água: *{meta}L/dia* (~{int(meta/0.2)} copos)")
+        else:
+            linhas.append("⚖️ Peso: _não registrado — use /peso_")
+
+        # Treino de hoje
+        dia_letra, _ = treino_hoje()
+        linhas.append(f"🏋️ Hoje: *{_NOME_DIA.get(dia_letra, 'Descanso')}*")
+
+        # Streaks
+        s_ac = streaks.get("academia", {}).get("sequencia", 0)
+        s_ag = streaks.get("agua", {}).get("sequencia", 0)
+        linhas.append(f"🔥 Sequência academia: *{s_ac} dia(s)*")
+        linhas.append(f"💧 Sequência hidratação: *{s_ag} dia(s)*")
+
+        # Tarefas
+        pendentes = [t for t in tarefas if not t.get("concluida")]
+        urgentes = [t for t in pendentes if t.get("prioridade") == "alta"]
+        linhas.append(f"📋 Tarefas pendentes: *{len(pendentes)}*" +
+                      (f" ({len(urgentes)} urgentes 🔴)" if urgentes else ""))
+
+        bot.reply_to(msg, "\n".join(linhas), parse_mode="Markdown")
+
+    @bot.message_handler(commands=["dicas"])
+    def cmd_dicas(msg):
+        api_key = config.get("groq", {}).get("api_key", "")
+        if not api_key or "SUA_KEY" in api_key:
+            bot.reply_to(msg, "⚠️ IA não configurada.")
+            return
+        bot.send_chat_action(msg.chat.id, "typing")
+        historico = carregar_historico_peso()
+        streaks = carregar_streaks()
+        dia_letra, exercicios = treino_hoje()
+        p = float(historico[-1]["peso"]) if historico else None
+        tend = tendencia_peso(historico) if historico else None
+        s_ac = streaks.get("academia", {}).get("sequencia", 0)
+
+        prompt = (
+            f"Você é o Orion, personal trainer e assistente do Bruno. "
+            f"Dados: peso {p}kg, tendência {tend}, sequência academia {s_ac} dias. "
+            f"Treino de hoje: {_NOME_DIA.get(dia_letra, 'Descanso')}. "
+            f"Dê 3 dicas práticas e personalizadas de treino, nutrição ou recuperação. "
+            f"Seja direto, use linguagem informal, máximo 6 linhas no total."
+        )
+        try:
+            resposta = _chamar_groq([{"role": "user", "content": prompt}], max_tokens=300)
+            bot.reply_to(msg, resposta)
+        except Exception as e:
+            bot.reply_to(msg, f"⚠️ Erro: {e}")
+
+    @bot.message_handler(commands=["meta_agua"])
+    def cmd_meta_agua(msg):
+        p = peso_atual()
+        if not p:
+            bot.reply_to(msg,
+                "Ainda não registrei seu peso.\nUse `/peso 80.5` primeiro!",
+                parse_mode="Markdown")
+            return
+        meta = calcular_meta_agua(p)
+        copos = int(meta / 0.2)
+        bot.reply_to(msg,
+            f"💧 *Meta de água personalizada:*\n\n"
+            f"Baseado no seu peso de *{p}kg*:\n"
+            f"→ *{meta}L por dia* (~{copos} copos de 200ml)\n\n"
+            f"_Fórmula: 35ml × peso corporal_",
+            parse_mode="Markdown")
 
     @bot.message_handler(commands=["treino"])
     def cmd_treino(msg):
