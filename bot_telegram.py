@@ -7,6 +7,9 @@ import sys
 import telebot
 import requests
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+FUSO = ZoneInfo("America/Sao_Paulo")
 
 _base = os.path.dirname(__file__)
 CONFIG_FILE = os.path.join(_base, "config.json") if os.path.exists(os.path.join(_base, "config.json")) else os.path.join(_base, "config.railway.json")
@@ -77,7 +80,7 @@ def perguntar_ia(chat_id, mensagem_usuario):
     if chat_id not in historico_chat:
         historico_chat[chat_id] = []
 
-    agora = datetime.now().strftime("%Y-%m-%d %H:%M")
+    agora = datetime.now(FUSO).strftime("%Y-%m-%d %H:%M")
     system_prompt = (
         "Você é o Orion, assistente pessoal parceiro do Bruno. "
         "Fale SEMPRE em português brasileiro informal e descontraído — como um amigo próximo, "
@@ -135,7 +138,7 @@ def salvar_lembretes_usuario(lembretes):
 
 
 def verificar_lembretes_especificos():
-    agora = datetime.now()
+    agora = datetime.now(FUSO)
     lembretes = carregar_lembretes_usuario()
     restantes = []
     for l in lembretes:
@@ -156,13 +159,13 @@ def verificar_lembretes_especificos():
 def enviar_lembrete(mensagem):
     chat_id = config["telegram"].get("chat_id", "")
     if not chat_id:
-        print(f"[{datetime.now().strftime('%H:%M')}] chat_id não configurado. Envie /start ao bot.")
+        print(f"[{datetime.now(FUSO).strftime('%H:%M')}] chat_id não configurado. Envie /start ao bot.")
         return
     try:
         bot.send_message(chat_id, mensagem)
-        print(f"[{datetime.now().strftime('%H:%M')}] Lembrete enviado")
+        print(f"[{datetime.now(FUSO).strftime('%H:%M')}] Lembrete enviado")
     except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M')}] Erro ao enviar lembrete: {e}")
+        print(f"[{datetime.now(FUSO).strftime('%H:%M')}] Erro ao enviar lembrete: {e}")
 
 
 def configurar_agenda():
