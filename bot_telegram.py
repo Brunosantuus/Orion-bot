@@ -21,6 +21,7 @@ LEMBRETES_USUARIO_FILE = os.path.join(_base, "lembretes_usuario.json")
 STREAKS_FILE = os.path.join(_base, "streaks.json")
 NOTAS_FILE = os.path.join(_base, "notas.json")
 PESO_FILE = os.path.join(_base, "peso_historico.json")
+AGUA_LOG_FILE = os.path.join(_base, "agua_log.json")
 
 config = {}
 bot = None
@@ -269,6 +270,92 @@ def tendencia_peso(historico, n=5):
     elif diff < -0.2:
         return f"↓ {diff}kg"
     return "→ estável"
+
+
+def carregar_agua_log():
+    if _USA_SB:
+        try:
+            return _sb_req("GET", "agua_log", {"select": "*", "order": "id"}) or []
+        except Exception:
+            pass
+    if os.path.exists(AGUA_LOG_FILE):
+        with open(AGUA_LOG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def _agua_log_local_save(lst):
+    with open(AGUA_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(lst, f, ensure_ascii=False, indent=2)
+
+
+def registrar_agua_log(fonte="manual"):
+    agora_str = datetime.now(FUSO).strftime("%Y-%m-%d %H:%M")
+    novo = {"datetime": agora_str, "fonte": fonte}
+    if _USA_SB:
+        try:
+            _sb_req("POST", "agua_log", body=novo)
+            return
+        except Exception:
+            pass
+    lst = carregar_agua_log()
+    lst.append(novo)
+    _agua_log_local_save(lst)
+
+
+def analisar_padroes_agua():
+    """Analisa horários de confirmação de água. Retorna (contagem_por_hora, texto)."""
+    logs = carregar_agua_log()
+    if len(logs) < 5:
+        return None, (
+            f"Poucos dados ainda — só {len(logs)} confirmação(ões).\n"
+            "Continua clicando em '💧 Bebi!' nos lembretes e eu monto o gráfico!"
+        )
+
+    contagem = {}
+    for l in logs:
+        try:
+            hora = int(l["datetime"][11:13])
+            contagem[hora] = contagem.get(hora, 0) + 1
+        except Exception:
+            continue
+
+    if not contagem:
+        return None, "Não consegui analisar os dados."
+
+    max_c = max(contagem.values())
+    total = sum(contagem.values())
+    lembretes_atuais = {10, 15}
+
+    linhas = [f"💧 *Seus horários de hidratação* ({total} confirmações):\n"]
+    for hora in sorted(contagem.keys()):
+        c = contagem[hora]
+        barras = max(1, int((c / max_c) * 8))
+        barra = "█" * barras + "░" * (8 - barras)
+        tag = " ⬅ lembrete atual" if hora in lembretes_atuais else ""
+        linhas.append(f"`{hora:02d}h` {barra} {c}x{tag}")
+
+    top = sorted(contagem.keys(), key=lambda h: contagem[h], reverse=True)
+    pico1 = top[0]
+    pico2 = top[1] if len(top) > 1 else None
+
+    linhas.append(f"\n🏆 Você bebe mais às *{pico1:02d}h*" +
+                  (f" e *{pico2:02d}h*" if pico2 else ""))
+
+    sugestoes = sorted([h for h in top[:2]])
+    if set(sugestoes) != lembretes_atuais:
+        s1, s2 = sugestoes[0], sugestoes[1] if len(sugestoes) > 1 else sugestoes[0]
+        linhas.append(
+            f"💡 Seus lembretes atuais são 10h e 15h, mas você hidrata mais às "
+            f"{s1:02d}h e {s2:02d}h.\n"
+            f"Quer ajustar? Use:\n"
+            f"`/lembrar beber água` → escolha todo dia → `{s1:02d}:00`\n"
+            f"`/lembrar beber água` → escolha todo dia → `{s2:02d}:00`"
+        )
+    else:
+        linhas.append("✅ Seus lembretes estão no horário certo — continue assim!")
+
+    return contagem, "\n".join(linhas)
 
 
 def _contexto_saude():
@@ -939,7 +1026,9 @@ def registrar_handlers():
             "/historico\\_peso — histórico de peso com tendência\n"
             "/meta\\_agua — ver meta de água pelo seu peso\n"
             "/stats — dashboard completo (peso, treino, hábitos, tarefas)\n"
-            "/dicas — dicas personalizadas da IA\n\n"
+            "/dicas — dicas personalizadas da IA\n"
+            "/bebi — registrar copo de água agora\n"
+            "/analise\\_agua — ver gráfico de quando você bebe água\n\n"
             "🏋️ *Academia:*\n"
             "/treino — treino de hoje\n"
             "/treino A — ver Dia A (Peito/Tríceps/Ombro)\n"
@@ -1137,6 +1226,10 @@ def registrar_handlers():
     def callback_habito(call):
         habito = call.data[len("habito_"):]
         seq, msg_streak = confirmar_habito(habito)
+
+        if habito == "agua":
+            registrar_agua_log(fonte="lembrete")
+
         if msg_streak is None:
             bot.answer_callback_query(call.id, "Já confirmado hoje! 👍")
             return
@@ -1326,6 +1419,28 @@ def registrar_handlers():
             f"→ *{meta}L por dia* (~{copos} copos de 200ml)\n\n"
             f"_Fórmula: 35ml × peso corporal_",
             parse_mode="Markdown")
+
+    @bot.message_handler(commands=["bebi"])
+    def cmd_bebi(msg):
+        registrar_agua_log(fonte="manual")
+        confirmar_habito("agua")
+        agora_str = datetime.now(FUSO).strftime("%H:%M")
+        logs = carregar_agua_log()
+        hoje = date.today().isoformat()
+        hoje_count = sum(1 for l in logs if l["datetime"].startswith(hoje))
+        p = peso_atual()
+        meta_str = ""
+        if p:
+            meta = calcular_meta_agua(p)
+            copos = int(meta / 0.2)
+            meta_str = f"\nHoje: *{hoje_count}/{copos} copos* (meta {meta}L)"
+        bot.reply_to(msg, f"💧 Água às *{agora_str}* registrada!{meta_str}", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["analise_agua"])
+    def cmd_analise_agua(msg):
+        bot.send_chat_action(msg.chat.id, "typing")
+        _, texto = analisar_padroes_agua()
+        bot.reply_to(msg, texto, parse_mode="Markdown")
 
     @bot.message_handler(commands=["treino"])
     def cmd_treino(msg):
