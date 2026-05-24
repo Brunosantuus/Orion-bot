@@ -234,6 +234,9 @@ def main():
     print("   🤖 ASSISTENTE DE LEMBRETES COM IA (Telegram)")
     print("=" * 54)
 
+    print(f"DEBUG ENV - TELEGRAM_TOKEN existe: {bool(os.environ.get('TELEGRAM_TOKEN'))}")
+    print(f"DEBUG ENV - GROQ_API_KEY existe: {bool(os.environ.get('GROQ_API_KEY'))}")
+
     carregar_config()
 
     token = config["telegram"].get("token", "")
