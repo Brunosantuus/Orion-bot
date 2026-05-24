@@ -77,12 +77,20 @@ def perguntar_ia(chat_id, mensagem_usuario):
     if chat_id not in historico_chat:
         historico_chat[chat_id] = []
 
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M")
     system_prompt = (
         "Você é um assistente pessoal chamado 'Lembrete'. "
         "Responda SEMPRE em português brasileiro de forma amigável, direta e objetiva. "
         "Você ajuda o usuário a gerenciar tarefas, saúde (beber água, exercícios) e trabalho. "
-        "Seja breve nas respostas — máximo 3 parágrafos.\n\n"
-        f"Tarefas atuais do usuário:\n{formatar_tarefas()}"
+        "Seja breve nas respostas — máximo 2 parágrafos.\n\n"
+        f"Data/hora atual: {agora}\n"
+        f"Tarefas atuais do usuário:\n{formatar_tarefas()}\n\n"
+        "IMPORTANTE: Quando o usuário pedir para lembrar de algo ou agendar uma tarefa, "
+        "inclua NO INÍCIO da resposta uma linha no formato exato:\n"
+        "[LEMBRETE:YYYY-MM-DD HH:MM:texto do lembrete]\n"
+        "Calcule a data/hora absoluta baseado na hora atual. "
+        "Exemplo: se agora é 16:56 e o usuário disse 'daqui 1 minuto', use 16:57. "
+        "Depois dessa linha, responda normalmente confirmando o agendamento."
     )
 
     historico_chat[chat_id].append({"role": "user", "content": mensagem_usuario})
@@ -367,6 +375,24 @@ def registrar_handlers():
         else:
             bot.send_chat_action(chat_id, "typing")
             resposta = perguntar_ia(chat_id, msg.text)
+
+            # Detecta se a IA criou um lembrete
+            if resposta.startswith("[LEMBRETE:"):
+                try:
+                    tag_fim = resposta.index("]")
+                    tag = resposta[1:tag_fim]  # LEMBRETE:YYYY-MM-DD HH:MM:texto
+                    partes = tag.split(":", 2)  # ["LEMBRETE", "YYYY-MM-DD HH", "MM:texto"] — ajuste abaixo
+                    # formato: LEMBRETE:2026-05-24 17:00:Beber água
+                    conteudo = tag[len("LEMBRETE:"):]
+                    dt_str, texto_lembrete = conteudo[:16], conteudo[17:]
+                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+                    lembretes = carregar_lembretes_usuario()
+                    lembretes.append({"tipo": "especifico", "texto": texto_lembrete, "datetime": dt.strftime("%Y-%m-%d %H:%M")})
+                    salvar_lembretes_usuario(lembretes)
+                    resposta = resposta[tag_fim + 1:].strip()
+                except Exception:
+                    pass
+
             bot.reply_to(msg, resposta)
 
 
