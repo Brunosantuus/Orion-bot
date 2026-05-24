@@ -1,0 +1,6 @@
+config.json
+tarefas.json
+*.vbs
+*.bat
+__pycache__/
+lembrete.py

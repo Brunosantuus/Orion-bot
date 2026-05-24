@@ -1,0 +1,36 @@
+{
+  "telegram": {
+    "token": "",
+    "chat_id": ""
+  },
+  "groq": {
+    "api_key": "",
+    "modelo": "llama-3.1-8b-instant"
+  },
+  "lembretes": [
+    {
+      "horario": "07:00",
+      "mensagem": "Bom dia! 🌅 Lembrete matinal:\n💧 Beba um copo d'água\n🍎 Tome seu café da manhã\n📋 Use /tarefas para ver o que tem hoje"
+    },
+    {
+      "horario": "10:00",
+      "mensagem": "⏰ Hora de beber água! 💧\nJá tomou pelo menos 2 copos hoje?"
+    },
+    {
+      "horario": "12:00",
+      "mensagem": "🍽️ Hora do almoço!\n💧 Não esqueça de se hidratar"
+    },
+    {
+      "horario": "15:00",
+      "mensagem": "☕ Pausa da tarde!\n💧 Beba água\n📋 Verifique as tarefas pendentes do sistema"
+    },
+    {
+      "horario": "18:00",
+      "mensagem": "🏋️ Hora da academia!\nVamos lá, você consegue! 💪"
+    },
+    {
+      "horario": "21:00",
+      "mensagem": "🌙 Encerrando o dia:\n✅ Você bebeu água suficiente?\n✅ Tarefas do sistema concluídas?\n✅ Prepare o que precisa para amanhã\n\nUse /tarefas para checar a lista."
+    }
+  ]
+}
