@@ -29,6 +29,10 @@ _snooze_pending = {}
 
 _HABITO_POR_HORARIO = {"10:00": "agua", "15:00": "agua", "18:00": "academia"}
 
+# Saquarema RJ
+_LAT = -22.9344
+_LON = -42.5049
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -116,6 +120,48 @@ def _prazo_label(prazo_iso):
         return f" 📅 {prazo_dt.strftime('%d/%m')}"
     except Exception:
         return ""
+
+
+# ── Clima (Open-Meteo, sem API key) ──────────────────────────────────────────
+
+def buscar_clima():
+    """Retorna string com temperatura e condição em Saquarema ou None se falhar."""
+    try:
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": _LAT,
+                "longitude": _LON,
+                "current": "temperature_2m,weathercode",
+                "hourly": "precipitation_probability",
+                "forecast_days": 1,
+                "timezone": "America/Sao_Paulo",
+            },
+            timeout=8,
+        )
+        if not r.ok:
+            return None
+        data = r.json()
+        temp = data["current"]["temperature_2m"]
+        wcode = data["current"]["weathercode"]
+
+        _desc = {
+            0: "céu limpo ☀️", 1: "quase limpo 🌤️", 2: "parcialmente nublado ⛅",
+            3: "nublado ☁️", 45: "neblina 🌫️", 48: "neblina 🌫️",
+            51: "garoa 🌦️", 53: "garoa 🌦️", 55: "garoa 🌦️",
+            61: "chuva 🌧️", 63: "chuva 🌧️", 65: "chuva forte 🌧️",
+            80: "pancadas 🌦️", 81: "pancadas 🌦️", 82: "pancadas fortes ⛈️",
+            95: "tempestade ⛈️", 96: "tempestade ⛈️", 99: "tempestade ⛈️",
+        }
+        desc = _desc.get(wcode, "tempo variável")
+
+        probs = data.get("hourly", {}).get("precipitation_probability", [])
+        max_prob = max(probs[:12]) if probs else 0
+        chuva = f", {max_prob}% de chuva" if max_prob >= 40 else ""
+
+        return f"{temp:.0f}°C, {desc}{chuva}"
+    except Exception:
+        return None
 
 
 # ── Tarefas ───────────────────────────────────────────────────────────────────
@@ -420,20 +466,22 @@ def perguntar_ia(chat_id, mensagem_usuario):
 
     agora = datetime.now(FUSO).strftime("%Y-%m-%d %H:%M")
     system_prompt = (
-        "Você é o Orion, assistente pessoal criado pelo Bruno para ajudá-lo no dia a dia. "
-        "Sua função principal é: lembrar tarefas, organizar a rotina, monitorar saúde (água, academia) e trabalho. "
-        "Você foi criado especificamente pelo Bruno e existe para ser útil a ele — isso define quem você é.\n\n"
-        "Estilo: descontraído e direto como um amigo próximo, sem formalidades, mas SEMPRE focado em ajudar. "
-        "Quando o Bruno pedir algo, execute primeiro e converse depois. "
-        "Respostas curtas e objetivas — máximo 2 linhas, sem enrolação.\n\n"
-        f"Data/hora atual: {agora}\n"
-        f"Tarefas do Bruno:\n{formatar_tarefas()}\n\n"
+        "Você é o Orion, assistente pessoal do Bruno — criado por ele e totalmente dedicado a deixar a vida dele mais fácil. "
+        "Você conhece o Bruno bem: trabalha na prefeitura de Saquarema, academia é prioridade, e às vezes esquece de beber água (não que você vá deixar barato).\n\n"
+        "Personalidade: você é aquele amigo engraçado do grupo — faz piada, usa gíria brasileira, é sarcástico na medida certa, mas quando precisa fazer, faz rápido. "
+        "Celebra quando o Bruno faz algo bom. Zoa levemente quando ele esquece as coisas. Nunca é robótico.\n\n"
+        "Regras:\n"
+        "- Respostas CURTAS — máximo 2-3 linhas, sem textão\n"
+        "- Executa primeiro, comenta depois\n"
+        "- Sem 'Olá!' no início, sem formalidade\n"
+        "- Emojis com moderação, só quando fizer sentido\n\n"
+        f"Agora são {agora}. Tarefas do Bruno:\n{formatar_tarefas()}\n\n"
         "REGRA OBRIGATÓRIA: sempre que o Bruno pedir pra lembrar, notificar ou agendar QUALQUER coisa, "
-        "você DEVE colocar exatamente esta linha no início da resposta (sem espaços extras):\n"
+        "coloque EXATAMENTE esta linha no início da resposta (sem espaços extras):\n"
         "[LEMBRETE:YYYY-MM-DD HH:MM:descrição]\n"
         "Use a data/hora atual para calcular horários relativos. "
         "Exemplos: 'daqui 1 minuto' → soma 1 min na hora atual. 'amanhã às 9h' → data de amanhã 09:00. "
-        "NUNCA omita essa linha quando houver pedido de lembrete. Depois confirme de forma animada."
+        "NUNCA omita essa linha quando houver pedido de lembrete."
     )
 
     historico_chat[chat_id].append({"role": "user", "content": mensagem_usuario})
@@ -564,12 +612,17 @@ def enviar_agenda_manha():
     ]
     lista_lem = ", ".join(l["texto"] for l in lembretes_hoje) if lembretes_hoje else "nenhum"
 
+    clima = buscar_clima()
+    clima_str = f"Clima em Saquarema agora: {clima}." if clima else ""
+
     try:
         prompt = (
-            f"Você é o Orion, assistente do Bruno. É manhã de {hoje}. "
-            f"Mande um bom dia animado e mostre a agenda do dia em até 4 linhas. "
+            f"Você é o Orion, assistente engraçado e descontraído do Bruno. É manhã de {hoje}. "
+            f"Mande um bom dia com sua personalidade — pode zoar um pouco, fazer uma piada leve, usar gíria. "
+            f"Mostre a agenda do dia em até 4 linhas no total. "
+            f"{clima_str} "
             f"Tarefas pendentes: {tarefas}. Lembretes de hoje: {lista_lem}. "
-            f"Destaque tarefas urgentes (🔴) se houver. Não use [LEMBRETE:...]. Seja direto e motivador."
+            f"Destaque urgentes se houver. Se tiver chuva prevista, avisa. Não use [LEMBRETE:...]."
         )
         mensagem = _chamar_groq([{"role": "user", "content": prompt}], max_tokens=200)
     except Exception:
@@ -657,11 +710,14 @@ def registrar_handlers():
             "/deletar\\_nota [n] — remover nota\n\n"
             "⏰ *Lembretes:*\n"
             "/lembrar [texto] — criar lembrete\n"
+            "/timer [min] [descrição] — timer rápido\n"
             "/meus\\_lembretes — ver lembretes criados\n"
             "/cancelar\\_lembrete [n] — remover lembrete\n\n"
+            "🔍 *Busca:*\n"
+            "/buscar [termo] — busca em tarefas e notas\n\n"
             "🏆 *Hábitos:*\n"
             "/streaks — ver sequência de hábitos\n\n"
-            "💬 *Ou mande uma mensagem — o Orion responde!*\n"
+            "💬 *Ou manda uma mensagem — o Orion responde!*\n"
             "_Ex: 'me lembra da reunião amanhã às 14h'_"
         ), parse_mode="Markdown")
 
@@ -895,6 +951,51 @@ def registrar_handlers():
             return
         linhas = [f"⏰ `{l['horario']}` — {l['mensagem'].splitlines()[0]}" for l in lembretes]
         bot.reply_to(msg, "📅 *Lembretes fixos:*\n\n" + "\n".join(linhas), parse_mode="Markdown")
+
+    @bot.message_handler(commands=["timer"])
+    def cmd_timer(msg):
+        partes = msg.text.replace("/timer", "").strip().split(None, 1)
+        if not partes:
+            bot.reply_to(msg, "⚠️ Uso: `/timer 25` ou `/timer 30 Ligar pro cliente`", parse_mode="Markdown")
+            return
+        try:
+            minutos = int(partes[0])
+            descricao = partes[1] if len(partes) > 1 else "Timer finalizado!"
+            dt = datetime.now(FUSO) + timedelta(minutes=minutos)
+            adicionar_lembrete_usuario({
+                "tipo": "especifico",
+                "texto": f"⏱️ {descricao}",
+                "datetime": dt.strftime("%Y-%m-%d %H:%M"),
+            })
+            bot.reply_to(msg,
+                         f"⏱️ Timer de *{minutos} min* configurado!\nVou te chamar às *{dt.strftime('%H:%M')}*.",
+                         parse_mode="Markdown")
+        except ValueError:
+            bot.reply_to(msg, "⚠️ Uso: `/timer 25` ou `/timer 30 Ligar pro cliente`", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["buscar"])
+    def cmd_buscar(msg):
+        termo = msg.text.replace("/buscar", "").strip().lower()
+        if not termo:
+            bot.reply_to(msg, "⚠️ Uso: `/buscar protocolo`", parse_mode="Markdown")
+            return
+        tarefas_match = [t for t in carregar_tarefas() if termo in t["texto"].lower()]
+        notas_match = [n for n in carregar_notas() if termo in n["texto"].lower()]
+        if not tarefas_match and not notas_match:
+            bot.reply_to(msg, f"🔍 Nada encontrado para *{termo}*.", parse_mode="Markdown")
+            return
+        linhas = [f"🔍 Resultados para *{termo}*:\n"]
+        if tarefas_match:
+            linhas.append("📋 *Tarefas:*")
+            for t in tarefas_match:
+                icone = "✅" if t.get("concluida") else ("🔴" if t.get("prioridade") == "alta" else "⬜")
+                prazo = _prazo_label(t.get("prazo")) if not t.get("concluida") else ""
+                linhas.append(f"  {icone} {t['texto']}{prazo}")
+        if notas_match:
+            linhas.append("\n📝 *Notas:*")
+            for n in notas_match:
+                linhas.append(f"  📝 {n['texto']}")
+        bot.reply_to(msg, "\n".join(linhas), parse_mode="Markdown")
 
     # ── Chat livre ──
 
