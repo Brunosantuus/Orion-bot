@@ -89,12 +89,12 @@ def perguntar_ia(chat_id, mensagem_usuario):
         "Respostas curtas e na vibe — máximo 2 parágrafos, sem enrolação.\n\n"
         f"Data/hora atual: {agora}\n"
         f"Tarefas do Bruno:\n{formatar_tarefas()}\n\n"
-        "IMPORTANTE: Quando o Bruno pedir pra lembrar de algo ou agendar, "
-        "coloca NO INÍCIO da resposta uma linha nesse formato exato:\n"
-        "[LEMBRETE:YYYY-MM-DD HH:MM:texto do lembrete]\n"
-        "Calcula a data/hora absoluta com base na hora atual. "
-        "Ex: se agora é 16:56 e ele disse 'daqui 1 minuto', usa 16:57. "
-        "Depois confirma o agendamento de forma animada."
+        "REGRA OBRIGATÓRIA: sempre que o Bruno pedir pra lembrar, notificar ou agendar QUALQUER coisa, "
+        "você DEVE colocar exatamente esta linha no início da resposta (sem espaços extras):\n"
+        "[LEMBRETE:YYYY-MM-DD HH:MM:descrição]\n"
+        "Use a data/hora atual para calcular horários relativos. "
+        "Exemplos: 'daqui 1 minuto' → soma 1 min na hora atual. 'amanhã às 9h' → data de amanhã 09:00. "
+        "NUNCA omita essa linha quando houver pedido de lembrete. Depois confirme de forma animada."
     )
 
     historico_chat[chat_id].append({"role": "user", "content": mensagem_usuario})
@@ -380,20 +380,17 @@ def registrar_handlers():
             bot.send_chat_action(chat_id, "typing")
             resposta = perguntar_ia(chat_id, msg.text)
 
-            # Detecta se a IA criou um lembrete
-            if resposta.startswith("[LEMBRETE:"):
+            # Detecta se a IA criou um lembrete — aceita espaços extras no formato
+            import re
+            match = re.search(r'\[LEMBRETE\s*:\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s*:\s*(.+?)\]', resposta)
+            if match:
                 try:
-                    tag_fim = resposta.index("]")
-                    tag = resposta[1:tag_fim]  # LEMBRETE:YYYY-MM-DD HH:MM:texto
-                    partes = tag.split(":", 2)  # ["LEMBRETE", "YYYY-MM-DD HH", "MM:texto"] — ajuste abaixo
-                    # formato: LEMBRETE:2026-05-24 17:00:Beber água
-                    conteudo = tag[len("LEMBRETE:"):]
-                    dt_str, texto_lembrete = conteudo[:16], conteudo[17:]
-                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+                    dt = datetime.strptime(f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H:%M")
+                    texto_lembrete = match.group(3).strip()
                     lembretes = carregar_lembretes_usuario()
                     lembretes.append({"tipo": "especifico", "texto": texto_lembrete, "datetime": dt.strftime("%Y-%m-%d %H:%M")})
                     salvar_lembretes_usuario(lembretes)
-                    resposta = resposta[tag_fim + 1:].strip()
+                    resposta = re.sub(r'\[LEMBRETE[^\]]+\]', '', resposta).strip()
                 except Exception:
                     pass
 

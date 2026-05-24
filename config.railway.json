@@ -5,7 +5,7 @@
   },
   "groq": {
     "api_key": "",
-    "modelo": "llama-3.1-8b-instant"
+    "modelo": "llama-3.3-70b-versatile"
   },
   "lembretes": [
     {
