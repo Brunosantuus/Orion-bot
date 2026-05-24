@@ -3,6 +3,7 @@ import os
 import schedule
 import threading
 import time
+import sys
 import telebot
 import requests
 from datetime import date, datetime
@@ -237,14 +238,12 @@ def main():
 
     token = config["telegram"].get("token", "")
     if "SEU_TOKEN" in token or not token:
-        print("\n❌ Configure o token do Telegram no arquivo config.json!")
-        input("\nPressione Enter para sair...")
-        return
+        print("\n❌ TELEGRAM_TOKEN não configurado! Defina a variável de ambiente.")
+        sys.exit(1)
 
-    api_key = config.get("gemini", {}).get("api_key", "")
+    api_key = config.get("groq", {}).get("api_key", "")
     if not api_key or "SUA_KEY" in api_key:
-        print("\n⚠️  Chave do Gemini não configurada — chat com IA não funcionará.")
-        print("   Adicione sua key em config.json → gemini.api_key")
+        print("\n⚠️  GROQ_API_KEY não configurada — chat com IA não funcionará.")
 
     bot = telebot.TeleBot(token)
     registrar_handlers()
