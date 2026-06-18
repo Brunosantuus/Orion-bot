@@ -529,6 +529,20 @@ def concluir_tarefa(idx):
     return t
 
 
+def concluir_tarefa_por_texto(descricao):
+    """Conclui a primeira tarefa pendente cujo texto combine com a descrição."""
+    lst = carregar_tarefas()
+    alvo = descricao.lower().strip()
+    palavras = [p for p in alvo.split() if len(p) > 3]
+    for i, t in enumerate(lst, 1):
+        if t.get("concluida"):
+            continue
+        texto = t.get("texto", "").lower()
+        if alvo in texto or texto in alvo or any(p in texto for p in palavras):
+            return concluir_tarefa(i)
+    return None
+
+
 def remover_tarefa(idx):
     lst = carregar_tarefas()
     t = lst[idx - 1]
@@ -801,7 +815,18 @@ def perguntar_ia(chat_id, mensagem_usuario):
         "coloque EXATAMENTE esta linha no início da resposta (sem espaços extras):\n"
         "[LEMBRETE:YYYY-MM-DD HH:MM:descrição]\n"
         "Use a data/hora atual para calcular horários relativos. "
-        "NUNCA omita essa linha quando houver pedido de lembrete."
+        "NUNCA omita essa linha quando houver pedido de lembrete.\n\n"
+        "GESTÃO DE TAREFAS (lista do sistema):\n"
+        "- Quando o Bruno pedir pra anotar/adicionar algo à lista de tarefas "
+        "(ex: 'anota que preciso comprar pão', 'adiciona pagar a conta na lista'), "
+        "coloque EXATAMENTE esta linha no início da resposta:\n"
+        "[TAREFA:descrição curta da tarefa]\n"
+        "- Quando ele disser que concluiu/terminou/fez uma tarefa "
+        "(ex: 'já paguei a conta', 'terminei o relatório', 'comprei o pão'), "
+        "coloque EXATAMENTE esta linha no início da resposta:\n"
+        "[CONCLUIR:descrição da tarefa concluída]\n"
+        "Sempre use a DESCRIÇÃO em [CONCLUIR], nunca o número. "
+        "Não invente tarefas que o Bruno não pediu. Depois da linha, responda normalmente."
     )
 
     historico_chat[chat_id].append({"role": "user", "content": mensagem_usuario})
@@ -1641,6 +1666,22 @@ def registrar_handlers():
                         "datetime": dt.strftime("%Y-%m-%d %H:%M"),
                     })
                     resposta = re.sub(r'\[LEMBRETE[^\]]+\]', '', resposta).strip()
+                except Exception:
+                    pass
+
+            m_tarefa = re.search(r'\[TAREFA\s*:\s*(.+?)\]', resposta)
+            if m_tarefa:
+                try:
+                    adicionar_tarefa(m_tarefa.group(1).strip())
+                    resposta = re.sub(r'\[TAREFA[^\]]*\]', '', resposta).strip()
+                except Exception:
+                    pass
+
+            m_concluir = re.search(r'\[CONCLUIR\s*:\s*(.+?)\]', resposta)
+            if m_concluir:
+                try:
+                    concluir_tarefa_por_texto(m_concluir.group(1).strip())
+                    resposta = re.sub(r'\[CONCLUIR[^\]]*\]', '', resposta).strip()
                 except Exception:
                     pass
 
