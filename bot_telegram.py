@@ -1579,6 +1579,11 @@ def registrar_handlers():
     @bot.message_handler(func=lambda m: True, content_types=["text"])
     def handle_texto(msg):
         chat_id = msg.chat.id
+        # Vincula o chat em qualquer mensagem (não só no /start), pois no Railway
+        # o config é efêmero e o chat_id é perdido a cada restart.
+        if not config["telegram"].get("chat_id"):
+            config["telegram"]["chat_id"] = str(chat_id)
+            salvar_config()
         estado = estados.get(chat_id, {})
 
         if estado.get("step") == "data":
