@@ -20,6 +20,7 @@ TAREFAS_FILE = os.path.join(_base, "tarefas.json")
 LEMBRETES_USUARIO_FILE = os.path.join(_base, "lembretes_usuario.json")
 STREAKS_FILE = os.path.join(_base, "streaks.json")
 NOTAS_FILE = os.path.join(_base, "notas.json")
+MEMORIA_FILE = os.path.join(_base, "memoria.json")
 PESO_FILE = os.path.join(_base, "peso_historico.json")
 AGUA_LOG_FILE = os.path.join(_base, "agua_log.json")
 
@@ -656,6 +657,58 @@ def remover_nota(idx):
     return n
 
 
+# ── Memória pessoal (fatos sobre o Bruno) ─────────────────────────────────────
+
+def carregar_memorias():
+    if _USA_SB:
+        try:
+            return _sb_req("GET", "memoria", {"select": "*", "order": "id"}) or []
+        except Exception:
+            pass
+    if os.path.exists(MEMORIA_FILE):
+        with open(MEMORIA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def _memorias_local_save(lst):
+    with open(MEMORIA_FILE, "w", encoding="utf-8") as f:
+        json.dump(lst, f, ensure_ascii=False, indent=2)
+
+
+def adicionar_memoria(fato):
+    fato = fato.strip()
+    if not fato:
+        return
+    # Evita guardar o mesmo fato duas vezes.
+    if fato.lower() in [m.get("fato", "").lower() for m in carregar_memorias()]:
+        return
+    nova = {"fato": fato, "criada": datetime.now(FUSO).strftime("%Y-%m-%d %H:%M")}
+    if _USA_SB:
+        try:
+            _sb_req("POST", "memoria", body=nova)
+            return
+        except Exception:
+            pass
+    lst = carregar_memorias()
+    lst.append(nova)
+    _memorias_local_save(lst)
+
+
+def remover_memoria(idx):
+    lst = carregar_memorias()
+    m = lst[idx - 1]
+    if _USA_SB:
+        try:
+            _sb_req("DELETE", "memoria", {"id": f"eq.{m['id']}"})
+            return m
+        except Exception:
+            pass
+    lst.pop(idx - 1)
+    _memorias_local_save(lst)
+    return m
+
+
 # ── Lembretes do usuário ──────────────────────────────────────────────────────
 
 def carregar_lembretes_usuario():
@@ -806,6 +859,12 @@ def perguntar_ia(chat_id, mensagem_usuario):
     agora = datetime.now(FUSO).strftime("%Y-%m-%d %H:%M")
     dia_letra, exercicios_hoje = treino_hoje()
     treino_ctx = formatar_treino(dia_letra, exercicios_hoje) if dia_letra != 'Descanso' else "Hoje é dia de descanso."
+
+    memorias = carregar_memorias()
+    if memorias:
+        memoria_ctx = "\n".join(f"- {m['fato']}" for m in memorias)
+    else:
+        memoria_ctx = "(nada guardado ainda)"
     system_prompt = (
         "Você é o Orion, assistente pessoal do Bruno — criado por ele e totalmente dedicado a deixar a vida dele mais fácil. "
         "Você conhece o Bruno bem: trabalha na prefeitura de Saquarema, academia é prioridade, e às vezes esquece de beber água (não que você vá deixar barato).\n\n"
@@ -820,6 +879,7 @@ def perguntar_ia(chat_id, mensagem_usuario):
         "- Sem 'Olá!' nem formalidade — fala como amigo no WhatsApp\n"
         "- Emojis com moderação\n\n"
         f"Agora são {agora}.\n"
+        f"O que você já sabe sobre o Bruno (use isso pra ser mais pessoal):\n{memoria_ctx}\n\n"
         f"Saúde do Bruno:\n{_contexto_saude()}\n\n"
         f"Tarefas:\n{formatar_tarefas()}\n\n"
         f"Treino de hoje:\n{treino_ctx}\n\n"
@@ -841,7 +901,11 @@ def perguntar_ia(chat_id, mensagem_usuario):
         "coloque EXATAMENTE esta linha no início da resposta:\n"
         "[CONCLUIR:descrição da tarefa concluída]\n"
         "Sempre use a DESCRIÇÃO em [CONCLUIR], nunca o número. "
-        "Não invente tarefas que o Bruno não pediu. Depois da linha, responda normalmente."
+        "Não invente tarefas que o Bruno não pediu. Depois da linha, responda normalmente.\n\n"
+        "MEMÓRIA PESSOAL: quando o Bruno contar um fato duradouro sobre ele que valha lembrar no futuro "
+        "(preferências, metas, rotina, gostos, alergias, pessoas importantes, etc.), coloque no início da resposta:\n"
+        "[MEMORIA:fato resumido em terceira pessoa]\n"
+        "Só registre fatos realmente úteis e duradouros — ignore conversa trivial e não repita o que você já sabe."
     )
 
     historico_chat[chat_id].append({"role": "user", "content": mensagem_usuario})
@@ -1244,6 +1308,31 @@ def registrar_handlers():
             bot.reply_to(msg, f"🗑️ Nota removida: _{nota['texto']}_", parse_mode="Markdown")
         except (ValueError, IndexError):
             bot.reply_to(msg, "⚠️ Uso: `/deletar_nota 1` (número da nota)", parse_mode="Markdown")
+
+    # ── Memória pessoal ──
+
+    @bot.message_handler(commands=["memorias"])
+    def cmd_memorias(msg):
+        memorias = carregar_memorias()
+        if not memorias:
+            bot.reply_to(msg, (
+                "🧠 Ainda não guardei nada sobre você.\n"
+                "É só me contar coisas no chat (ex: 'minha meta é chegar a 80kg') "
+                "que eu vou lembrando sozinho."
+            ))
+            return
+        linhas = [f"{i}. 🧠 {m['fato']}" for i, m in enumerate(memorias, 1)]
+        bot.reply_to(msg, "🧠 *O que eu sei sobre você:*\n\n" + "\n".join(linhas) +
+                     "\n\nUse `/esquecer [número]` pra eu apagar.", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["esquecer"])
+    def cmd_esquecer(msg):
+        try:
+            n = int(msg.text.replace("/esquecer", "").strip())
+            m = remover_memoria(n)
+            bot.reply_to(msg, f"🗑️ Esqueci: _{m['fato']}_", parse_mode="Markdown")
+        except (ValueError, IndexError):
+            bot.reply_to(msg, "⚠️ Uso: `/esquecer 1` (número da memória, veja em /memorias)", parse_mode="Markdown")
 
     # ── Streaks ──
 
@@ -1709,6 +1798,17 @@ def registrar_handlers():
                     resposta = re.sub(r'\[CONCLUIR[^\]]*\]', '', resposta).strip()
                 except Exception:
                     pass
+
+            m_memoria = re.search(r'\[MEMORIA\s*:\s*(.+?)\]', resposta)
+            if m_memoria:
+                try:
+                    adicionar_memoria(m_memoria.group(1).strip())
+                    resposta = re.sub(r'\[MEMORIA[^\]]*\]', '', resposta).strip()
+                except Exception:
+                    pass
+
+            if not resposta.strip():
+                resposta = "👍"
 
             bot.reply_to(msg, resposta)
 
