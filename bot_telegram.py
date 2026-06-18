@@ -127,7 +127,10 @@ def _sb_req(method, table, filters=None, body=None):
     }
     r = requests.request(method, url, headers=headers, json=body, timeout=10)
     try:
-        return r.json() if r.content else []
+        data = r.json() if r.content else []
+        # Supabase devolve um dict em caso de erro (ex: tabela inexistente).
+        # Os callers sempre esperam lista, então normalizamos.
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
@@ -438,7 +441,9 @@ def _contexto_saude():
 def carregar_treino_dia(dia_letra):
     if _USA_SB:
         try:
-            return _sb_req("GET", "treinos", {"dia_letra": f"eq.{dia_letra}", "select": "*", "order": "id"}) or []
+            dados = _sb_req("GET", "treinos", {"dia_letra": f"eq.{dia_letra}", "select": "*", "order": "id"})
+            if dados:
+                return dados
         except Exception:
             pass
     return _TREINOS_FIXOS.get(dia_letra, [])
@@ -448,7 +453,8 @@ def carregar_agenda_treino():
     if _USA_SB:
         try:
             dados = _sb_req("GET", "agenda_treino", {"select": "*"})
-            return {int(d["dia_semana"]): d["dia_letra"] for d in (dados or [])}
+            if dados:
+                return {int(d["dia_semana"]): d["dia_letra"] for d in dados}
         except Exception:
             pass
     return _AGENDA_FIXA
