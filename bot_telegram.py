@@ -770,13 +770,18 @@ def confirmar_habito(habito):
 
 # ── IA via Groq ───────────────────────────────────────────────────────────────
 
-def _chamar_groq(mensagens, max_tokens=512):
+def _chamar_groq(mensagens, max_tokens=512, temperature=0.75):
     api_key = config.get("groq", {}).get("api_key", "")
     modelo = config.get("groq", {}).get("modelo", "llama-3.3-70b-versatile")
     resp = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": modelo, "messages": mensagens, "max_tokens": max_tokens},
+        json={
+            "model": modelo,
+            "messages": mensagens,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        },
         timeout=30,
     )
     resp.raise_for_status()
@@ -803,9 +808,10 @@ def perguntar_ia(chat_id, mensagem_usuario):
         "Você também é um personal trainer informal — conhece o treino do Bruno e pode sugerir substituições de exercícios, "
         "progressão de carga, dicas de execução e ajustes baseados em dores ou limitações que ele mencionar.\n\n"
         "Regras:\n"
-        "- Respostas CURTAS — máximo 3 linhas, sem textão\n"
+        "- Respostas curtas e diretas (1 a 4 linhas), com naturalidade — nada de textão\n"
+        "- Varie o jeito de falar; não soe repetitivo nem robótico\n"
         "- Executa primeiro, comenta depois\n"
-        "- Sem 'Olá!' no início, sem formalidade\n"
+        "- Sem 'Olá!' nem formalidade — fala como amigo no WhatsApp\n"
         "- Emojis com moderação\n\n"
         f"Agora são {agora}.\n"
         f"Saúde do Bruno:\n{_contexto_saude()}\n\n"
@@ -961,18 +967,28 @@ def enviar_agenda_manha():
     lista_lem = ", ".join(l["texto"] for l in lembretes_hoje) if lembretes_hoje else "nenhum"
 
     clima = buscar_clima()
-    clima_str = f"Clima em Saquarema agora: {clima}." if clima else ""
+    clima_str = f"Clima em Saquarema agora: {clima}." if clima else "Clima indisponível."
+
+    dia_letra, exercicios_hoje = treino_hoje()
+    treino_str = (
+        formatar_treino(dia_letra, exercicios_hoje)
+        if dia_letra != 'Descanso' else "Hoje é dia de descanso (sem treino)."
+    )
 
     try:
         prompt = (
             f"Você é o Orion, assistente engraçado e descontraído do Bruno. É manhã de {hoje}. "
-            f"Mande um bom dia com sua personalidade — pode zoar um pouco, fazer uma piada leve, usar gíria. "
-            f"Mostre a agenda do dia em até 4 linhas no total. "
-            f"{clima_str} "
-            f"Tarefas pendentes: {tarefas}. Lembretes de hoje: {lista_lem}. "
-            f"Destaque urgentes se houver. Se tiver chuva prevista, avisa. Não use [LEMBRETE:...]."
+            f"Monte um briefing matinal com sua personalidade (pode zoar leve, usar gíria), curto e útil. "
+            f"Organize de forma fluida, com quebras de linha e no máximo 1 emoji por item:\n"
+            f"1) Um bom dia rápido.\n"
+            f"2) {clima_str} Se previr chuva ou calor forte, avisa.\n"
+            f"3) Treino de hoje: {treino_str}\n"
+            f"4) Tarefas pendentes: {tarefas}. Destaque as urgentes.\n"
+            f"5) Lembretes de hoje: {lista_lem}.\n"
+            f"6) Feche com uma frase curta de motivação.\n"
+            f"Máximo ~7 linhas no total. Não use [LEMBRETE:...], [TAREFA:...] nem [CONCLUIR:...]."
         )
-        mensagem = _chamar_groq([{"role": "user", "content": prompt}], max_tokens=200)
+        mensagem = _chamar_groq([{"role": "user", "content": prompt}], max_tokens=320, temperature=0.85)
     except Exception:
         mensagem = config.get("lembretes", [{}])[0].get(
             "mensagem", "Bom dia! ☀️\n💧 Beba água\n📋 Use /tarefas para ver o dia"
