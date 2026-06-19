@@ -905,7 +905,12 @@ def perguntar_ia(chat_id, mensagem_usuario):
         "MEMÓRIA PESSOAL: quando o Bruno contar um fato duradouro sobre ele que valha lembrar no futuro "
         "(preferências, metas, rotina, gostos, alergias, pessoas importantes, etc.), coloque no início da resposta:\n"
         "[MEMORIA:fato resumido em terceira pessoa]\n"
-        "Só registre fatos realmente úteis e duradouros — ignore conversa trivial e não repita o que você já sabe."
+        "Só registre fatos realmente úteis e duradouros — ignore conversa trivial e não repita o que você já sabe.\n\n"
+        "BUSCA NA WEB: quando o Bruno pedir uma informação ATUAL ou externa que você não tem certeza "
+        "(preço, cotação, notícia, clima de outra cidade, resultado de jogo, fatos que mudam, ou quando ele disser 'pesquisa/procura X'), "
+        "coloque EXATAMENTE esta linha no início da resposta:\n"
+        "[BUSCAR:o que pesquisar]\n"
+        "Prefira buscar a chutar informação que pode estar desatualizada. Use só quando precisar de info externa/atual."
     )
 
     historico_chat[chat_id].append({"role": "user", "content": mensagem_usuario})
@@ -922,6 +927,58 @@ def perguntar_ia(chat_id, mensagem_usuario):
         return "⏳ A IA demorou demais. Tente novamente."
     except Exception as e:
         return f"⚠️ Erro ao consultar IA: {str(e)}"
+
+
+def buscar_web(termo):
+    """Pesquisa na web via Tavily. Retorna texto com resumo + fontes, ou None."""
+    api_key = os.environ.get("TAVILY_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": termo,
+                "search_depth": "basic",
+                "include_answer": True,
+                "max_results": 4,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        partes = []
+        if data.get("answer"):
+            partes.append(data["answer"])
+        for res in (data.get("results") or [])[:4]:
+            titulo = res.get("title", "")
+            conteudo = (res.get("content", "") or "")[:300]
+            if titulo or conteudo:
+                partes.append(f"- {titulo}: {conteudo}")
+        return "\n".join(partes) if partes else None
+    except Exception:
+        return None
+
+
+def responder_com_busca(chat_id, termo, resultado):
+    """Pede à IA pra responder usando o resultado da busca, com personalidade."""
+    if not resultado:
+        return "🔍 Não consegui pesquisar isso agora. Tenta de novo daqui a pouco?"
+    prompt = (
+        "Você é o Orion, assistente descontraído do Bruno. Ele fez uma pergunta que exigiu busca na web.\n"
+        f"Termo pesquisado: '{termo}'.\n"
+        f"Resultado da busca:\n{resultado}\n\n"
+        "Responda ao Bruno de forma curta, natural e com sua personalidade, usando essas informações. "
+        "Não invente; se a busca não trouxer a resposta, diga isso. Não use nenhuma tag tipo [BUSCAR]."
+    )
+    try:
+        resp = _chamar_groq([{"role": "user", "content": prompt}], max_tokens=400, temperature=0.7)
+        historico_chat.setdefault(chat_id, []).append({"role": "assistant", "content": resp})
+        _hist_salvar(chat_id, "assistant", resp)
+        return resp
+    except Exception:
+        return f"🔍 Achei isso:\n{resultado[:600]}"
 
 
 # ── Alertas e automações ──────────────────────────────────────────────────────
@@ -1768,6 +1825,13 @@ def registrar_handlers():
         else:
             bot.send_chat_action(chat_id, "typing")
             resposta = perguntar_ia(chat_id, msg.text)
+
+            m_buscar = re.search(r'\[BUSCAR\s*:\s*(.+?)\]', resposta)
+            if m_buscar:
+                termo = m_buscar.group(1).strip()
+                bot.send_chat_action(chat_id, "typing")
+                resultado = buscar_web(termo)
+                resposta = responder_com_busca(chat_id, termo, resultado)
 
             match = re.search(r'\[LEMBRETE\s*:\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s*:\s*(.+?)\]', resposta)
             if match:
