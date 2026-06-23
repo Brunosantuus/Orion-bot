@@ -2,6 +2,7 @@ import json
 import os
 import re
 import schedule
+import tempfile
 import threading
 import time
 import sys
@@ -981,6 +982,37 @@ def responder_com_busca(chat_id, termo, resultado):
         return f"🔍 Achei isso:\n{resultado[:600]}"
 
 
+def gerar_registro_atendimento(notas):
+    """Transforma anotações informais de atendimento no texto formal do Registro."""
+    api_key = config.get("groq", {}).get("api_key", "")
+    if not api_key or "SUA_KEY" in api_key:
+        return "⚠️ IA não configurada."
+    hoje = datetime.now(FUSO).strftime("%d/%m/%Y")
+    prompt = (
+        "Você é o assistente do Bruno (Núcleo de Tecnologia Municipal de Rio Bonito). "
+        "A partir das anotações informais dele sobre um atendimento, gere o REGISTRO DE ATENDIMENTO.\n"
+        "Regras de redação:\n"
+        "- Texto em 3a pessoa, impessoal e institucional (1 paragrafo, 4 a 6 frases).\n"
+        "- Tom formal, sem girias e sem primeira pessoa ('eu fiz').\n"
+        "- Nao repita o nome da escola no inicio da descricao.\n"
+        "- Cite a data por extenso (ex: 'em 22 de junho de 2026') e os nomes com o cargo.\n"
+        "- Separe o que foi RESOLVIDO (deixando explicito quando foi solucionado na hora) do que permanece PENDENTE.\n"
+        f"- Use a data de hoje ({hoje}) se ele nao informar outra. NUNCA invente nomes nem datas — "
+        "se faltar algo essencial, pergunte em vez de gerar.\n\n"
+        "Responda EXATAMENTE neste formato (texto puro, sem markdown):\n"
+        "📋 REGISTRO DE ATENDIMENTO\n\n"
+        "🏫 Unidade: <nome da escola>\n"
+        "📍 Modalidade: <PRESENCIAL ou ON-LINE>\n"
+        "📅 Data: <dd/mm/aaaa>\n\n"
+        "📝 Descrição:\n<o texto formal pronto>\n\n"
+        f"Anotações do Bruno:\n{notas}"
+    )
+    try:
+        return _chamar_groq([{"role": "user", "content": prompt}], max_tokens=700, temperature=0.4)
+    except Exception as e:
+        return f"⚠️ Erro ao gerar o registro: {e}"
+
+
 # ── Alertas e automações ──────────────────────────────────────────────────────
 
 def verificar_prazos():
@@ -1217,6 +1249,73 @@ def thread_agenda():
         time.sleep(30)
 
 
+# ── Registro de Atendimento (Diário Digital) ──────────────────────────────────
+
+_MESES_PT = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho",
+             "agosto", "setembro", "outubro", "novembro", "dezembro"]
+
+_TEMPLATE_REGISTRO = os.path.join(os.path.dirname(__file__), "templates", "registro_atendimento.docx")
+
+
+def gerar_texto_atendimento_formal(modalidade, texto_cru, data_extenso):
+    """Usa a Groq para transformar anotações informais no parágrafo formal do registro."""
+    system = (
+        "Você redige registros oficiais de atendimento do Núcleo de Tecnologia Municipal "
+        "de Rio Bonito (RJ). A partir de anotações informais, escreva UM único parágrafo "
+        "formal, impessoal e em terceira pessoa (Foi realizado..., Procedeu-se..., "
+        "Realizou-se...). Regras: NÃO repita o nome da escola no início; cite a data por "
+        "extenso e os nomes com seus cargos quando houver; deixe explícito o que foi "
+        "resolvido no próprio atendimento e o que permanece pendente; 4 a 6 frases; "
+        "sem emojis, sem gírias, sem primeira pessoa. Responda APENAS com o parágrafo."
+    )
+    user = (
+        f"Modalidade: {modalidade}\n"
+        f"Data do atendimento: {data_extenso}\n"
+        f"Anotações informais: {texto_cru}"
+    )
+    txt = _chamar_groq(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=400, temperature=0.4,
+    ).strip()
+    return txt.strip('"').strip()
+
+
+def montar_docx_atendimento(escola, modalidade, descricao_formal, hoje, out_path):
+    """Preenche o template do Registro de Atendimento e salva em out_path."""
+    from docx import Document
+    d = Document(_TEMPLATE_REGISTRO)
+
+    # [2] Unidade Escolar — nome sublinhado, mantendo as linhas
+    p2 = d.paragraphs[2]
+    r0 = p2.runs[0]
+    label = "Unidade Escolar: "
+    unders = r0.text[len(label):]
+    r0.text = label
+    rn = p2.add_run(escola)
+    rn.underline = True
+    p2.add_run(unders[len(escola):] if len(unders) > len(escola) else unders)
+
+    # [4] marca X em ON-LINE (run4) ou PRESENCIAL (run2)
+    alvo = 4 if modalidade.upper().startswith("ON") else 2
+    d.paragraphs[4].runs[alvo].text = "( X"
+
+    # [6] descrição formal sublinhada, sem linhas em branco extras
+    p6 = d.paragraphs[6]
+    for r in list(p6.runs):
+        r.text = ""
+    p6.runs[0].text = descricao_formal
+    p6.runs[0].underline = True
+
+    # [12] data de hoje
+    p12 = d.paragraphs[12]
+    p12.runs[0].text = f"Rio Bonito {hoje.day:02d} / {hoje.month:02d} / {hoje.year}"
+    for r in p12.runs[1:]:
+        r.text = ""
+
+    d.save(out_path)
+    return out_path
+
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 def registrar_handlers():
@@ -1263,6 +1362,8 @@ def registrar_handlers():
             "/treino B — ver Dia B (Pernas)\n"
             "/treino C — ver Dia C (Costas/Bíceps)\n"
             "/add\\_exercicio A Peito Supino 4 6-8 — adicionar exercício\n\n"
+            "📄 *Documentos:*\n"
+            "/registro Escola | online | o que foi feito — gera o Registro de Atendimento\n\n"
             "🔍 *Busca:*\n"
             "/buscar [termo] — busca em tarefas e notas\n\n"
             "🏆 *Hábitos:*\n"
@@ -1270,6 +1371,60 @@ def registrar_handlers():
             "💬 *Ou manda uma mensagem — o Orion responde!*\n"
             "_Ex: 'me lembra da reunião amanhã às 14h'_"
         ), parse_mode="Markdown")
+
+    # ── Registro de Atendimento ──
+
+    @bot.message_handler(commands=["registro", "atendimento"])
+    def cmd_registro(msg):
+        partes_cmd = msg.text.split(None, 1)
+        raw = partes_cmd[1].strip() if len(partes_cmd) > 1 else ""
+        partes = [p.strip() for p in raw.split("|")]
+        if len(partes) < 3 or not all(partes[:2]) or not partes[2]:
+            bot.reply_to(msg, (
+                "⚠️ *Uso:* `/registro Escola | online ou presencial | o que foi feito`\n\n"
+                "*Ex:* `/registro E.M. Maurício Kopke | online | resolvi o acesso aos "
+                "lançamentos de notas de uma professora na hora, corrigi frequências "
+                "incorretas de uma turma, falta carga horária da ATA e ficha individual`"
+            ), parse_mode="Markdown")
+            return
+
+        escola = partes[0]
+        modalidade = "ON-LINE" if partes[1].lower().startswith("on") else "PRESENCIAL"
+        texto_cru = "|".join(partes[2:]).strip()
+
+        bot.send_chat_action(msg.chat.id, "typing")
+        hoje = datetime.now(FUSO)
+        data_ext = f"{hoje.day} de {_MESES_PT[hoje.month - 1]} de {hoje.year}"
+
+        try:
+            descricao = gerar_texto_atendimento_formal(modalidade, texto_cru, data_ext)
+        except Exception as e:
+            bot.reply_to(msg, f"⚠️ Erro ao gerar o texto pela IA: {e}")
+            return
+
+        out = os.path.join(
+            tempfile.gettempdir(),
+            f"registro_atendimento_{hoje:%Y%m%d_%H%M%S}.docx",
+        )
+        try:
+            montar_docx_atendimento(escola, modalidade, descricao, hoje, out)
+        except Exception as e:
+            bot.reply_to(msg, f"⚠️ Texto gerado, mas falhou montar o documento: {e}\n\n{descricao}")
+            return
+
+        try:
+            with open(out, "rb") as f:
+                bot.send_document(
+                    msg.chat.id, f,
+                    visible_file_name=f"Registro de Atendimento - {escola}.docx",
+                    caption=f"📄 Registro de Atendimento — {escola} ({modalidade}) — {hoje:%d/%m/%Y}",
+                )
+            bot.send_message(msg.chat.id, f"📝 *Texto gerado:*\n\n{descricao}", parse_mode="Markdown")
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
 
     # ── Tarefas ──
 
@@ -1770,6 +1925,22 @@ def registrar_handlers():
                 linhas.append(f"  📝 {n['texto']}")
         bot.reply_to(msg, "\n".join(linhas), parse_mode="Markdown")
 
+    @bot.message_handler(commands=["registro"])
+    def cmd_registro(msg):
+        notas = msg.text.replace("/registro", "", 1).strip()
+        if notas:
+            bot.send_chat_action(msg.chat.id, "typing")
+            bot.reply_to(msg, gerar_registro_atendimento(notas))
+        else:
+            estados[msg.chat.id] = {"step": "registro"}
+            bot.reply_to(msg, (
+                "📋 Registro de Atendimento\n\n"
+                "Me manda as anotações do atendimento (pode ser bem informal), tipo:\n"
+                '"escola Posse, online, secretário Jorge e secretária Ana, resolvi o acesso a notas '
+                'de uma professora, corrigi frequências de uma turma, falta carga horária da ATA"\n\n'
+                "Que eu te devolvo o texto formal pronto. 👇"
+            ))
+
     # ── Chat livre ──
 
     @bot.message_handler(func=lambda m: True, content_types=["text"])
@@ -1821,6 +1992,11 @@ def registrar_handlers():
                              parse_mode="Markdown")
             except Exception:
                 bot.reply_to(msg, "⚠️ Formato inválido. Use: `HH:MM`", parse_mode="Markdown")
+
+        elif estado.get("step") == "registro":
+            del estados[chat_id]
+            bot.send_chat_action(chat_id, "typing")
+            bot.reply_to(msg, gerar_registro_atendimento(msg.text))
 
         else:
             bot.send_chat_action(chat_id, "typing")
