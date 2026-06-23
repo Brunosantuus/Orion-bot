@@ -1455,7 +1455,7 @@ def registrar_handlers():
             "/treino C — ver Dia C (Costas/Bíceps)\n"
             "/add\\_exercicio A Peito Supino 4 6-8 — adicionar exercício\n\n"
             "📄 *Documentos:*\n"
-            "/registro Escola | online | o que foi feito — gera o Registro de Atendimento\n\n"
+            "/registro — gera o Registro de Atendimento em PDF (manda as anotações que ele formaliza)\n\n"
             "🔍 *Busca:*\n"
             "/buscar [termo] — busca em tarefas e notas\n\n"
             "🏆 *Hábitos:*\n"
@@ -1464,59 +1464,7 @@ def registrar_handlers():
             "_Ex: 'me lembra da reunião amanhã às 14h'_"
         ), parse_mode="Markdown")
 
-    # ── Registro de Atendimento ──
-
-    @bot.message_handler(commands=["registro", "atendimento"])
-    def cmd_registro(msg):
-        partes_cmd = msg.text.split(None, 1)
-        raw = partes_cmd[1].strip() if len(partes_cmd) > 1 else ""
-        partes = [p.strip() for p in raw.split("|")]
-        if len(partes) < 3 or not all(partes[:2]) or not partes[2]:
-            bot.reply_to(msg, (
-                "⚠️ *Uso:* `/registro Escola | online ou presencial | o que foi feito`\n\n"
-                "*Ex:* `/registro E.M. Maurício Kopke | online | resolvi o acesso aos "
-                "lançamentos de notas de uma professora na hora, corrigi frequências "
-                "incorretas de uma turma, falta carga horária da ATA e ficha individual`"
-            ), parse_mode="Markdown")
-            return
-
-        escola = partes[0]
-        modalidade = "ON-LINE" if partes[1].lower().startswith("on") else "PRESENCIAL"
-        texto_cru = "|".join(partes[2:]).strip()
-
-        bot.send_chat_action(msg.chat.id, "typing")
-        hoje = datetime.now(FUSO)
-        data_ext = f"{hoje.day} de {_MESES_PT[hoje.month - 1]} de {hoje.year}"
-
-        try:
-            descricao = gerar_texto_atendimento_formal(modalidade, texto_cru, data_ext)
-        except Exception as e:
-            bot.reply_to(msg, f"⚠️ Erro ao gerar o texto pela IA: {e}")
-            return
-
-        out = os.path.join(
-            tempfile.gettempdir(),
-            f"registro_atendimento_{hoje:%Y%m%d_%H%M%S}.docx",
-        )
-        try:
-            montar_docx_atendimento(escola, modalidade, descricao, hoje, out)
-        except Exception as e:
-            bot.reply_to(msg, f"⚠️ Texto gerado, mas falhou montar o documento: {e}\n\n{descricao}")
-            return
-
-        try:
-            with open(out, "rb") as f:
-                bot.send_document(
-                    msg.chat.id, f,
-                    visible_file_name=f"Registro de Atendimento - {escola}.docx",
-                    caption=f"📄 Registro de Atendimento — {escola} ({modalidade}) — {hoje:%d/%m/%Y}",
-                )
-            bot.send_message(msg.chat.id, f"📝 *Texto gerado:*\n\n{descricao}", parse_mode="Markdown")
-        finally:
-            try:
-                os.remove(out)
-            except OSError:
-                pass
+    # ── Registro de Atendimento: handler /registro (gera PDF) fica mais abaixo, antes do Chat livre ──
 
     # ── Tarefas ──
 
@@ -2017,9 +1965,9 @@ def registrar_handlers():
                 linhas.append(f"  📝 {n['texto']}")
         bot.reply_to(msg, "\n".join(linhas), parse_mode="Markdown")
 
-    @bot.message_handler(commands=["registro"])
+    @bot.message_handler(commands=["registro", "atendimento"])
     def cmd_registro(msg):
-        notas = msg.text.replace("/registro", "", 1).strip()
+        notas = re.sub(r"^/(registro|atendimento)", "", msg.text, count=1).strip()
         if notas:
             bot.send_chat_action(msg.chat.id, "typing")
             enviar_registro(msg.chat.id, notas)
