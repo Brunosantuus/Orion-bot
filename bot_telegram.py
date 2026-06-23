@@ -1013,6 +1013,98 @@ def gerar_registro_atendimento(notas):
         return f"⚠️ Erro ao gerar o registro: {e}"
 
 
+def _latin1(texto):
+    """Sanitiza texto pro conjunto latin-1 (fonte padrão do fpdf2)."""
+    repl = {"–": "-", "—": "-", "“": '"', "”": '"', "‘": "'", "’": "'", "…": "...", "•": "-"}
+    for k, v in repl.items():
+        texto = texto.replace(k, v)
+    return texto.encode("latin-1", "replace").decode("latin-1")
+
+
+def _parse_registro(texto):
+    """Extrai os campos do texto gerado pela IA. Retorna dict ou None se não for um registro."""
+    u = re.search(r"Unidade:\s*(.+)", texto)
+    mod = re.search(r"Modalidade:\s*(.+)", texto)
+    dt = re.search(r"Data:\s*([\d/]+)", texto)
+    desc = re.search(r"Descri[çc][ãa]o:\s*(.+)", texto, re.DOTALL)
+    if not (u and desc):
+        return None
+    modalidade = mod.group(1).strip().upper() if mod else ""
+    return {
+        "unidade": u.group(1).strip(),
+        "modalidade": "ON-LINE" if "ON" in modalidade else "PRESENCIAL",
+        "data": dt.group(1).strip() if dt else datetime.now(FUSO).strftime("%d/%m/%Y"),
+        "descricao": desc.group(1).strip(),
+    }
+
+
+def gerar_pdf_registro(dados, caminho):
+    """Monta o PDF do Registro de Atendimento no layout oficial."""
+    from fpdf import FPDF
+    pdf = FPDF(format="A4")
+    pdf.add_page()
+    pdf.set_margins(20, 20, 20)
+
+    pdf.set_font("Helvetica", "B", 12)
+    for linha in ["ESTADO DO RIO DE JANEIRO", "PREFEITURA MUNICIPAL DE RIO BONITO",
+                  "SECRETARIA MUNICIPAL DE EDUCAÇÃO", "NÚCLEO DE TECNOLOGIA MUNICIPAL - DIÁRIO DIGITAL"]:
+        pdf.cell(0, 7, _latin1(linha), ln=1, align="C")
+    pdf.ln(8)
+
+    pdf.set_font("Helvetica", "", 12)
+    pdf.cell(32, 8, "Unidade Escolar:", ln=0)
+    pdf.set_font("Helvetica", "U", 12)
+    pdf.cell(0, 8, _latin1(" " + dados["unidade"]), ln=1)
+    pdf.ln(4)
+
+    pres = "X" if dados["modalidade"].startswith("PRES") else " "
+    onl = "X" if dados["modalidade"].startswith("ON") else " "
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, _latin1(f"REGISTRO DE ATENDIMENTO - PRESENCIAL ( {pres} )    ON-LINE ( {onl} )"), ln=1)
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "U", 12)
+    pdf.multi_cell(0, 8, _latin1(dados["descricao"]), align="J")
+    pdf.ln(12)
+
+    pdf.set_font("Helvetica", "", 12)
+    pdf.cell(0, 8, "Assinaturas:", ln=1)
+    pdf.ln(2)
+    for _ in range(3):
+        pdf.cell(0, 10, "_" * 78, ln=1)
+    pdf.ln(6)
+
+    dia, mes, ano = "__", "__", "____"
+    try:
+        dia, mes, ano = dados["data"].split("/")
+    except Exception:
+        pass
+    pdf.cell(0, 8, _latin1(f"Rio Bonito {dia} / {mes} / {ano}"), ln=1)
+    pdf.output(caminho)
+
+
+def enviar_registro(chat_id, notas):
+    """Gera o texto formal, envia, e anexa o PDF se os campos forem extraídos."""
+    texto = gerar_registro_atendimento(notas)
+    bot.send_message(chat_id, texto)
+    dados = _parse_registro(texto)
+    if not dados:
+        return  # IA pediu mais informação em vez de gerar — não há PDF a fazer
+    caminho = os.path.join(_base, f"registro_{chat_id}.pdf")
+    try:
+        gerar_pdf_registro(dados, caminho)
+        with open(caminho, "rb") as f:
+            bot.send_document(chat_id, f, caption="📄 Registro em PDF — pronto pra imprimir e assinar.")
+    except Exception as e:
+        bot.send_message(chat_id, f"(O texto acima está pronto, mas não consegui gerar o PDF: {e})")
+    finally:
+        if os.path.exists(caminho):
+            try:
+                os.remove(caminho)
+            except Exception:
+                pass
+
+
 # ── Alertas e automações ──────────────────────────────────────────────────────
 
 def verificar_prazos():
@@ -1930,7 +2022,7 @@ def registrar_handlers():
         notas = msg.text.replace("/registro", "", 1).strip()
         if notas:
             bot.send_chat_action(msg.chat.id, "typing")
-            bot.reply_to(msg, gerar_registro_atendimento(notas))
+            enviar_registro(msg.chat.id, notas)
         else:
             estados[msg.chat.id] = {"step": "registro"}
             bot.reply_to(msg, (
@@ -1996,7 +2088,7 @@ def registrar_handlers():
         elif estado.get("step") == "registro":
             del estados[chat_id]
             bot.send_chat_action(chat_id, "typing")
-            bot.reply_to(msg, gerar_registro_atendimento(msg.text))
+            enviar_registro(chat_id, msg.text)
 
         else:
             bot.send_chat_action(chat_id, "typing")

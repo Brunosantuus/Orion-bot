@@ -1,3 +1,5 @@
 pyTelegramBotAPI
 schedule
 requests
+python-docx
+fpdf2
