@@ -45,6 +45,16 @@ CTRL_PORT = int(os.environ.get('ORION_CTRL_PORT', '8765'))
 SRV_USER = os.environ.get('ORION_SRV_USER', 'orion')
 SRV_PASS = os.environ.get('ORION_SRV_PASS', '')
 
+# ── Alertas proativos (bateria / temperatura / serviço caído / offline) ──
+ALERT_CHAT_ID = os.environ.get('ORION_ALERT_CHAT_ID') or os.environ.get('TELEGRAM_CHAT_ID', '')
+BAT_LOW = int(os.environ.get('ORION_BAT_LOW', '20'))
+BAT_HIGH = int(os.environ.get('ORION_BAT_HIGH', '90'))
+TEMP_MAX = float(os.environ.get('ORION_TEMP_MAX', '50'))
+OFFLINE_SEC = int(os.environ.get('ORION_OFFLINE_SEC', '150'))
+
+_BOT = None
+_ALERTA = {'bat_low': False, 'bat_high': False, 'temp': False, 'offline': False, 'servicos': None}
+
 # Estado compartilhado entre o servidor HTTP e os comandos do Telegram
 ESTADO = {'ultimo_report': None, 'ts': 0.0}
 FILA_COMANDOS = []          # comandos pendentes p/ o celular executar
@@ -242,8 +252,104 @@ def _tratar_upload(bot, msg):
         bot.reply_to(msg, f"❌ Servidor recusou (HTTP {r.status_code}).")
 
 
+def _enviar_alerta(texto):
+    if not (_BOT and ALERT_CHAT_ID):
+        return
+    try:
+        _BOT.send_message(ALERT_CHAT_ID, texto, parse_mode="Markdown")
+    except Exception as e:
+        print(f"[orion_servidor] falha ao enviar alerta: {e}")
+
+
+def _monitor_alertas():
+    """Loop que avalia o último report e dispara alertas (com debounce)."""
+    while True:
+        time.sleep(30)
+        try:
+            with _LOCK:
+                rep = ESTADO['ultimo_report']
+                ts = ESTADO['ts']
+            if not rep:
+                continue
+            idade = time.time() - ts
+
+            # offline / online (não avalia o resto com dados velhos)
+            if idade > OFFLINE_SEC:
+                if not _ALERTA['offline']:
+                    _ALERTA['offline'] = True
+                    _enviar_alerta(f"📴 *Servidor do celular offline* — sem contato há "
+                                   f"{int(idade)}s. (Tailscale caiu ou o Android encerrou o agente.)")
+                continue
+            if _ALERTA['offline']:
+                _ALERTA['offline'] = False
+                _enviar_alerta("✅ *Servidor do celular voltou* — contato restabelecido.")
+
+            # bateria
+            bat = rep.get('bateria')
+            if isinstance(bat, int):
+                if bat < BAT_LOW and not _ALERTA['bat_low']:
+                    _ALERTA['bat_low'] = True
+                    _enviar_alerta(f"🪫 *Bateria baixa: {bat}%* — o celular pode desligar. "
+                                   f"Verifique o carregador.")
+                elif bat >= BAT_LOW + 10:
+                    _ALERTA['bat_low'] = False
+                if rep.get('carregando') and bat >= BAT_HIGH and not _ALERTA['bat_high']:
+                    _ALERTA['bat_high'] = True
+                    _enviar_alerta(f"🔋 *Bateria em {bat}%* e carregando. Num celular 24/7 no "
+                                   f"carregador, ficar sempre em ~100% desgasta a bateria — "
+                                   f"considere um limitador de carga (~80%).")
+                elif bat < BAT_HIGH - 10:
+                    _ALERTA['bat_high'] = False
+
+            # temperatura
+            temp = rep.get('temperatura')
+            if isinstance(temp, (int, float)) and temp > 0:
+                if temp > TEMP_MAX and not _ALERTA['temp']:
+                    _ALERTA['temp'] = True
+                    _enviar_alerta(f"🌡️ *Celular quente: {temp}°C* (acima de {int(TEMP_MAX)}°C). "
+                                   f"Verifique ventilação/carga.")
+                elif temp < TEMP_MAX - 5:
+                    _ALERTA['temp'] = False
+
+            # serviços (transição no ar -> caiu)
+            svc = rep.get('servicos', {}) or {}
+            prev = _ALERTA['servicos']
+            if prev is not None:
+                nomes = {'fileserver': 'Arquivos', 'mediaserver': 'Media',
+                         'todoserver': 'Tarefas', 'dnsblocker': 'DNS', 'cloudflared': 'Túneis'}
+                caidos = [nomes.get(k, k) for k in svc if prev.get(k) and not svc.get(k)]
+                if caidos:
+                    _enviar_alerta("❌ *Serviço(s) fora do ar:* " + ", ".join(caidos) +
+                                   "\nUse /ligar para restabelecer.")
+            _ALERTA['servicos'] = dict(svc)
+        except Exception as e:
+            print(f"[orion_servidor] erro no monitor de alertas: {e}")
+
+
+def _iniciar_alertas():
+    if not ALERT_CHAT_ID:
+        print("[orion_servidor] alertas DESLIGADOS (defina ORION_ALERT_CHAT_ID ou TELEGRAM_CHAT_ID).")
+        return
+    threading.Thread(target=_monitor_alertas, daemon=True).start()
+    print(f"[orion_servidor] alertas ativos (bat<{BAT_LOW}%, temp>{int(TEMP_MAX)}°C, "
+          f"offline>{OFFLINE_SEC}s) -> chat {ALERT_CHAT_ID}")
+
+
 def registrar_comandos(bot):
-    """Registra /servidor /tunnels /ligar /desligar e o upload de arquivos."""
+    """Registra /servidor /tunnels /ligar /desligar, upload e alertas."""
+    global _BOT
+    _BOT = bot
+    _iniciar_alertas()
+
+    @bot.message_handler(commands=["alertas"])
+    def _cmd_alertas(msg):
+        estado = "🟢 ligados" if ALERT_CHAT_ID else "🔴 desligados (falta ORION_ALERT_CHAT_ID)"
+        bot.reply_to(msg, f"🔔 *Alertas do servidor* — {estado}\n\n"
+                          f"🪫 Bateria baixa: < {BAT_LOW}%\n"
+                          f"🔋 Bateria alta: ≥ {BAT_HIGH}% (carregando)\n"
+                          f"🌡️ Temperatura: > {int(TEMP_MAX)}°C\n"
+                          f"📴 Offline: sem contato > {OFFLINE_SEC}s",
+                     parse_mode="Markdown")
 
     @bot.message_handler(content_types=['document', 'photo', 'video', 'audio', 'voice'])
     def _cmd_upload(msg):
