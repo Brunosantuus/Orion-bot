@@ -51,7 +51,7 @@ export function ChatPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <ScrollArea className="flex-1 px-4 py-3">
+      <ScrollArea className="min-h-0 flex-1 px-4 py-3">
         <div className="flex flex-col gap-2.5">
           {!carregando && mensagens.length === 0 && (
             <div className="mt-10 flex flex-col items-center gap-3 text-center">
