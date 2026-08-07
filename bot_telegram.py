@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import re
@@ -6,8 +7,16 @@ import tempfile
 import threading
 import time
 import sys
+import xml.etree.ElementTree as ET
+import zipfile
+
+from dotenv import load_dotenv
+load_dotenv()  # lê .env local, se existir — precisa vir antes do import orion_servidor
+              # (esse módulo lê variáveis de ambiente já no import).
+
 import telebot
 import requests
+import orion_servidor
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -24,6 +33,8 @@ NOTAS_FILE = os.path.join(_base, "notas.json")
 MEMORIA_FILE = os.path.join(_base, "memoria.json")
 PESO_FILE = os.path.join(_base, "peso_historico.json")
 AGUA_LOG_FILE = os.path.join(_base, "agua_log.json")
+TREINO_HISTORICO_FILE = os.path.join(_base, "treino_historico.json")
+SAUDE_DIARIA_FILE = os.path.join(_base, "saude_diaria.json")
 
 config = {}
 bot = None
@@ -116,6 +127,10 @@ def salvar_config():
 _SB_URL = os.environ.get("SUPABASE_URL", "")
 _SB_KEY = os.environ.get("SUPABASE_KEY", "")
 _USA_SB = bool(_SB_URL and _SB_KEY)
+# Sessão compartilhada (keep-alive) — evita reabrir TCP/TLS a cada chamada,
+# importante quando um import em lote (ex: export de saúde) faz centenas de
+# requisições em sequência.
+_SB_SESSION = requests.Session()
 
 
 def _sb_req(method, table, filters=None, body=None):
@@ -127,11 +142,11 @@ def _sb_req(method, table, filters=None, body=None):
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
-    r = requests.request(method, url, headers=headers, json=body, timeout=10)
+    r = _SB_SESSION.request(method, url, headers=headers, json=body, timeout=10)
+    r.raise_for_status()  # tabela inexistente/erro de sintaxe etc. levantam exceção —
+                           # quem chama já espera isso e cai no fallback local (não engolir aqui).
     try:
         data = r.json() if r.content else []
-        # Supabase devolve um dict em caso de erro (ex: tabela inexistente).
-        # Os callers sempre esperam lista, então normalizamos.
         return data if isinstance(data, list) else []
     except Exception:
         return []
@@ -426,16 +441,206 @@ def _contexto_saude():
         tend = tendencia_peso(historico)
         partes.append(f"Peso: {p}kg{(' (' + tend + ')') if tend else ''}")
         partes.append(f"Meta de água: {meta}L/dia ({int(meta/0.2)} copos de 200ml)")
-    dia_letra, _ = treino_hoje()
-    if dia_letra != 'Descanso':
-        partes.append(f"Treino hoje: {_NOME_DIA.get(dia_letra, dia_letra)}")
+    hist_treino = sorted(carregar_treino_historico(), key=lambda h: h["data"])[-14:]
+    if hist_treino:
+        ultimo = hist_treino[-1]
+        dias = (date.today() - date.fromisoformat(ultimo["data"])).days
+        partes.append(f"Treinou {_NOME_DIA.get(ultimo['dia_letra'], ultimo['dia_letra'])} " +
+                       ("hoje" if dias == 0 else f"há {dias} dia(s)"))
+        feitos_semana = {h["dia_letra"] for h in hist_treino
+                         if (date.today() - date.fromisoformat(h["data"])).days < 7}
+        faltando = {'A', 'B', 'C'} - feitos_semana
+        if faltando:
+            partes.append("Ainda não fez essa semana: " + ", ".join(sorted(faltando)))
     else:
-        partes.append("Hoje é dia de descanso")
+        dia_letra, _ = treino_hoje()
+        if dia_letra != 'Descanso':
+            partes.append(f"Treino hoje: {_NOME_DIA.get(dia_letra, dia_letra)}")
+        else:
+            partes.append("Hoje é dia de descanso")
     streaks = carregar_streaks()
     s = streaks.get("academia", {}).get("sequencia", 0)
     if s:
         partes.append(f"Sequência academia: {s} dias")
+    registro_saude = saude_hoje()
+    if registro_saude:
+        if registro_saude.get("horas_sono") is not None:
+            partes.append(f"Sono: {registro_saude['horas_sono']}h")
+        if registro_saude.get("fc_repouso") is not None:
+            partes.append(f"FC repouso: {registro_saude['fc_repouso']}bpm")
+        if registro_saude.get("passos") is not None:
+            partes.append(f"Passos hoje: {registro_saude['passos']}")
     return "\n".join(partes)
+
+
+def montar_resumo_dashboard():
+    """Dict JSON-serializável com o resumo de hoje, consumido por orion_servidor.py
+    (endpoint GET /api/resumo do dashboard web)."""
+    historico = carregar_historico_peso()
+    streaks = carregar_streaks()
+    tarefas = carregar_tarefas()
+    dia_letra = proximo_treino_sugerido()
+    registro_saude = saude_hoje() or {}
+
+    return {
+        "peso": {
+            "atual": float(historico[-1]["peso"]) if historico else None,
+            "tendencia": tendencia_peso(historico) if historico else None,
+        },
+        "treino_sugerido": _NOME_DIA.get(dia_letra, dia_letra),
+        "streaks": {
+            "academia": streaks.get("academia", {}).get("sequencia", 0),
+            "agua": streaks.get("agua", {}).get("sequencia", 0),
+        },
+        "saude_hoje": {
+            "passos": registro_saude.get("passos"),
+            "horas_sono": registro_saude.get("horas_sono"),
+            "fc_repouso": registro_saude.get("fc_repouso"),
+        },
+        "tarefas_pendentes": len([t for t in tarefas if not t.get("concluida")]),
+    }
+
+
+# ── Saúde diária (métricas do relógio) ────────────────────────────────────────
+
+def carregar_saude_diaria():
+    if _USA_SB:
+        try:
+            return _sb_req("GET", "saude_diaria", {"select": "*", "order": "data.asc"}) or []
+        except Exception:
+            pass
+    if os.path.exists(SAUDE_DIARIA_FILE):
+        with open(SAUDE_DIARIA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def _saude_diaria_local_save(lst):
+    with open(SAUDE_DIARIA_FILE, "w", encoding="utf-8") as f:
+        json.dump(lst, f, ensure_ascii=False, indent=2)
+
+
+def registrar_saude_diaria(data=None, fonte="manual", **campos):
+    """Grava métricas de saúde do dia, mesclando com o que já existir (não apaga campos antigos)."""
+    data = data or date.today().isoformat()
+    campos = {k: v for k, v in campos.items() if v is not None}
+
+    if _USA_SB:
+        try:
+            existente = _sb_req("GET", "saude_diaria", {"data": f"eq.{data}", "select": "*"})
+            if existente:
+                _sb_req("PATCH", "saude_diaria", {"data": f"eq.{data}"}, {**campos, "fonte": fonte})
+            else:
+                _sb_req("POST", "saude_diaria", body={"data": data, "fonte": fonte, **campos})
+            return
+        except Exception:
+            pass
+
+    lst = carregar_saude_diaria()
+    atual = next((r for r in lst if r.get("data") == data), None)
+    if atual:
+        atual.update(campos)
+        atual["fonte"] = fonte
+    else:
+        lst.append({"data": data, "fonte": fonte, **campos})
+    _saude_diaria_local_save(lst)
+
+
+def saude_hoje():
+    hoje = date.today().isoformat()
+    return next((r for r in carregar_saude_diaria() if r.get("data") == hoje), None)
+
+
+# ── Import do export do Apple Saúde (Configurações > ícone do perfil > "Exportar
+# Todos os Dados de Saúde", manda o .zip/.xml pro bot como documento) ─────────
+
+_JANELA_EXPORT_DIAS = 120  # ignora registros mais antigos — não precisamos de anos de histórico
+
+
+def _extrair_xml_export(conteudo_bytes, nome_arquivo):
+    """Devolve um file-like object com o XML principal do export, seja de um .zip ou .xml direto.
+
+    O nome do arquivo dentro do zip varia por idioma do iPhone (ex: "export.xml" em
+    inglês, "exportar.xml" em português) — em vez de fixar um nome, pega o maior
+    .xml do zip que não seja o "export_cda.xml" (um resumo clínico bem menor,
+    não é o que a gente quer)."""
+    if nome_arquivo.lower().endswith('.zip'):
+        with zipfile.ZipFile(io.BytesIO(conteudo_bytes)) as z:
+            candidatos = [info for info in z.infolist()
+                          if info.filename.lower().endswith('.xml') and 'cda' not in info.filename.lower()]
+            if not candidatos:
+                raise ValueError("não achei um XML de export dentro do zip")
+            maior = max(candidatos, key=lambda info: info.file_size)
+            return io.BytesIO(z.read(maior.filename))
+    return io.BytesIO(conteudo_bytes)
+
+
+def processar_export_apple_health(conteudo_bytes, nome_arquivo):
+    """Lê o export do Apple Saúde (.zip ou .xml) e preenche saude_diaria dos
+    últimos ~120 dias (passos, calorias, FC média/repouso, horas de sono)."""
+    xml_file = _extrair_xml_export(conteudo_bytes, nome_arquivo)
+    limite = date.today() - timedelta(days=_JANELA_EXPORT_DIAS)
+    dias = {}
+
+    def _dia(chave):
+        return dias.setdefault(chave, {"passos": 0.0, "calorias": 0.0, "fc_amostras": [],
+                                        "fc_repouso": None, "sono_seg": 0.0})
+
+    for _, elem in ET.iterparse(xml_file, events=("end",)):
+        if elem.tag == "Record":
+            try:
+                tipo = elem.get("type")
+                inicio = datetime.strptime(elem.get("startDate"), "%Y-%m-%d %H:%M:%S %z")
+                if inicio.date() >= limite:
+                    dia_str = inicio.date().isoformat()
+                    if tipo == "HKQuantityTypeIdentifierStepCount":
+                        _dia(dia_str)["passos"] += float(elem.get("value", 0))
+                    elif tipo == "HKQuantityTypeIdentifierActiveEnergyBurned":
+                        _dia(dia_str)["calorias"] += float(elem.get("value", 0))
+                    elif tipo == "HKQuantityTypeIdentifierHeartRate":
+                        _dia(dia_str)["fc_amostras"].append(float(elem.get("value", 0)))
+                    elif tipo == "HKQuantityTypeIdentifierRestingHeartRate":
+                        _dia(dia_str)["fc_repouso"] = float(elem.get("value", 0))
+                    elif tipo == "HKCategoryTypeIdentifierSleepAnalysis" and "Asleep" in (elem.get("value") or ""):
+                        fim = datetime.strptime(elem.get("endDate"), "%Y-%m-%d %H:%M:%S %z")
+                        # sono de madrugada conta pro dia em que a pessoa desperta (fim do período)
+                        _dia(fim.date().isoformat())["sono_seg"] += (fim - inicio).total_seconds()
+            except Exception:
+                pass
+        elem.clear()
+
+    if not dias:
+        return "⚠️ Não encontrei registros recentes nesse export (ou o formato não é o esperado)."
+
+    for dia_str, d in dias.items():
+        campos = {}
+        if d["passos"]:
+            campos["passos"] = int(d["passos"])
+        if d["calorias"]:
+            campos["calorias"] = int(d["calorias"])
+        if d["fc_amostras"]:
+            campos["fc_media"] = round(sum(d["fc_amostras"]) / len(d["fc_amostras"]))
+        if d["fc_repouso"] is not None:
+            campos["fc_repouso"] = int(d["fc_repouso"])
+        if d["sono_seg"]:
+            campos["horas_sono"] = round(d["sono_seg"] / 3600, 1)
+        if campos:
+            registrar_saude_diaria(data=dia_str, fonte="apple_health_export", **campos)
+
+    dias_ordenados = sorted(dias.keys())
+    linhas = [f"✅ Export processado! {len(dias_ordenados)} dia(s), de *{dias_ordenados[0]}* a *{dias_ordenados[-1]}*."]
+    hoje = saude_hoje()
+    if hoje:
+        partes = []
+        if hoje.get("passos") is not None:
+            partes.append(f"{hoje['passos']} passos")
+        if hoje.get("horas_sono") is not None:
+            partes.append(f"{hoje['horas_sono']}h de sono")
+        if hoje.get("fc_repouso") is not None:
+            partes.append(f"FC repouso {hoje['fc_repouso']}bpm")
+        if partes:
+            linhas.append("Hoje: " + ", ".join(partes))
+    return "\n".join(linhas)
 
 
 # ── Treinos ───────────────────────────────────────────────────────────────────
@@ -483,6 +688,107 @@ def formatar_treino(dia_letra, exercicios):
             linhas.append(f"\n{icone} *{grupo_atual}*")
         linhas.append(f"  • {e['exercicio']} — {e['series']}x{e['repeticoes']}")
     return "\n".join(linhas)
+
+
+# ── Histórico real de treino (rotação adaptativa) ─────────────────────────────
+
+_FONTE_PRIORIDADE_TREINO = {"chat": 2, "auto": 2, "manual": 1}
+
+
+def carregar_treino_historico():
+    if _USA_SB:
+        try:
+            return _sb_req("GET", "treino_historico", {"select": "*", "order": "data.asc"}) or []
+        except Exception:
+            pass
+    if os.path.exists(TREINO_HISTORICO_FILE):
+        with open(TREINO_HISTORICO_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def _treino_historico_local_save(lst):
+    with open(TREINO_HISTORICO_FILE, "w", encoding="utf-8") as f:
+        json.dump(lst, f, ensure_ascii=False, indent=2)
+
+
+def registrar_treino_realizado(dia_letra, fonte="manual"):
+    """Grava o treino do dia (upsert) e confirma o streak de academia.
+
+    Uma fonte só sobrescreve o registro de hoje se tiver prioridade >= a da fonte
+    já gravada — evita que o botão genérico ("✅ Fui!") apague um treino que o
+    usuário já confirmou por texto (ex: "hoje vou treinar perna").
+    """
+    hoje = date.today().isoformat()
+    dados = {
+        "data": hoje,
+        "dia_letra": dia_letra,
+        "fonte": fonte,
+        "atualizado_em": datetime.now(FUSO).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    prioridade_nova = _FONTE_PRIORIDADE_TREINO.get(fonte, 1)
+
+    if _USA_SB:
+        try:
+            existente = _sb_req("GET", "treino_historico", {"data": f"eq.{hoje}", "select": "*"})
+            if existente:
+                if prioridade_nova >= _FONTE_PRIORIDADE_TREINO.get(existente[0].get("fonte"), 1):
+                    _sb_req("PATCH", "treino_historico", {"data": f"eq.{hoje}"}, dados)
+            else:
+                _sb_req("POST", "treino_historico", body=dados)
+        except Exception:
+            pass
+    else:
+        lst = carregar_treino_historico()
+        atual = next((h for h in lst if h.get("data") == hoje), None)
+        if atual is None:
+            lst.append(dados)
+            _treino_historico_local_save(lst)
+        elif prioridade_nova >= _FONTE_PRIORIDADE_TREINO.get(atual.get("fonte"), 1):
+            lst = [h for h in lst if h.get("data") != hoje] + [dados]
+            _treino_historico_local_save(lst)
+
+    return confirmar_habito("academia")
+
+
+def proximo_treino_sugerido():
+    """Próximo treino da rotação A→B→C baseado no que foi REALMENTE treinado,
+    não na agenda fixa por dia da semana (usada só como cold-start)."""
+    historico = sorted(carregar_treino_historico(), key=lambda h: h["data"])
+    if not historico:
+        return treino_hoje()[0]
+
+    ultimo = historico[-1]
+    if ultimo["data"] == date.today().isoformat():
+        return ultimo["dia_letra"]
+
+    rotacao = ['A', 'B', 'C']
+    idx = rotacao.index(ultimo["dia_letra"]) if ultimo["dia_letra"] in rotacao else 0
+    return rotacao[(idx + 1) % 3]
+
+
+_GATILHOS_TREINO = re.compile(
+    r'\b(vou treinar|bora treinar|treino de|treinar hoje|dia de treino|hoje.{0,10}treino)\b', re.IGNORECASE)
+_NEGACAO_TREINO = re.compile(r'\bn[ãa]o\b.{0,25}\b(vou|treino|treinar)\b', re.IGNORECASE)
+
+_PALAVRAS_GRUPO_TREINO = {
+    'A': ('peito', 'tríceps', 'triceps', 'ombro', 'supino'),
+    'B': ('perna', 'pernas', 'quadríceps', 'quadriceps', 'posterior', 'panturrilha', 'agachamento', 'glúteo', 'gluteo'),
+    'C': ('costas', 'bíceps', 'biceps', 'abdômen', 'abdomen', 'puxada', 'remada'),
+}
+
+
+def detectar_override_treino(texto):
+    """Reconhece frases tipo 'hoje vou treinar perna' no texto livre e retorna a dia_letra, ou None."""
+    t = texto.lower()
+    if _NEGACAO_TREINO.search(t):
+        return None
+    if not _GATILHOS_TREINO.search(t):
+        return None
+    for letra, palavras in _PALAVRAS_GRUPO_TREINO.items():
+        if any(re.search(rf'\b{p}\b', t) for p in palavras):
+            return letra
+    return None
 
 
 # ── Tarefas ───────────────────────────────────────────────────────────────────
@@ -771,6 +1077,36 @@ def _deletar_lembrete_especifico(l):
     _lembretes_local_save(lst)
 
 
+def criar_lembrete_web(tipo, texto, data_hora=None, hora=None):
+    """Cria um lembrete a partir do dashboard web — mesma validação/efeito do /lembrar no Telegram."""
+    texto = (texto or "").strip()
+    if not texto:
+        raise ValueError("texto vazio")
+    if tipo == "especifico":
+        if not data_hora:
+            raise ValueError("data/hora obrigatória pra lembrete específico")
+        datetime.strptime(data_hora, "%Y-%m-%d %H:%M")  # valida formato, levanta se inválido
+        adicionar_lembrete_usuario({"tipo": "especifico", "texto": texto, "datetime": data_hora})
+    elif tipo == "diario":
+        if not hora:
+            raise ValueError("hora obrigatória pra lembrete diário")
+        datetime.strptime(hora, "%H:%M")
+        adicionar_lembrete_usuario({"tipo": "diario", "texto": texto, "hora": hora})
+        configurar_agenda()
+    else:
+        raise ValueError("tipo inválido (use 'especifico' ou 'diario')")
+
+
+def remover_lembrete_por_id(lembrete_id):
+    """Remove um lembrete pelo id do Supabase — usado pela rota web (a numeração
+    do /cancelar_lembrete no Telegram é por posição, aqui é direto pelo id)."""
+    if _USA_SB:
+        _sb_req("DELETE", "lembretes_usuario", {"id": f"eq.{lembrete_id}"})
+        configurar_agenda()
+        return
+    raise RuntimeError("remoção pelo dashboard requer Supabase configurado")
+
+
 # ── Streaks ───────────────────────────────────────────────────────────────────
 
 def carregar_streaks():
@@ -848,17 +1184,22 @@ def _chamar_groq(mensagens, max_tokens=512, temperature=0.75):
     return resp.json()["choices"][0]["message"]["content"]
 
 
+_HIST_LOCK = threading.Lock()
+
+
 def perguntar_ia(chat_id, mensagem_usuario):
     api_key = config.get("groq", {}).get("api_key", "")
     if not api_key or "SUA_KEY" in api_key:
         return "⚠️ Configure a chave do Groq no config.json"
 
     # Carrega do Supabase se não estiver em memória (ex: após restart)
-    if chat_id not in historico_chat:
-        historico_chat[chat_id] = _hist_carregar_db(chat_id)
+    with _HIST_LOCK:
+        if chat_id not in historico_chat:
+            historico_chat[chat_id] = _hist_carregar_db(chat_id)
 
     agora = datetime.now(FUSO).strftime("%Y-%m-%d %H:%M")
-    dia_letra, exercicios_hoje = treino_hoje()
+    dia_letra = proximo_treino_sugerido()
+    exercicios_hoje = carregar_treino_dia(dia_letra) if dia_letra != 'Descanso' else []
     treino_ctx = formatar_treino(dia_letra, exercicios_hoje) if dia_letra != 'Descanso' else "Hoje é dia de descanso."
 
     memorias = carregar_memorias()
@@ -914,14 +1255,15 @@ def perguntar_ia(chat_id, mensagem_usuario):
         "Prefira buscar a chutar informação que pode estar desatualizada. Use só quando precisar de info externa/atual."
     )
 
-    historico_chat[chat_id].append({"role": "user", "content": mensagem_usuario})
+    with _HIST_LOCK:
+        historico_chat[chat_id].append({"role": "user", "content": mensagem_usuario})
+        mensagens = historico_chat[chat_id][-HIST_CONTEXTO:]
     _hist_salvar(chat_id, "user", mensagem_usuario)
-
-    mensagens = historico_chat[chat_id][-HIST_CONTEXTO:]
 
     try:
         resposta = _chamar_groq([{"role": "system", "content": system_prompt}] + mensagens)
-        historico_chat[chat_id].append({"role": "assistant", "content": resposta})
+        with _HIST_LOCK:
+            historico_chat[chat_id].append({"role": "assistant", "content": resposta})
         _hist_salvar(chat_id, "assistant", resposta)
         return resposta
     except requests.exceptions.Timeout:
@@ -975,11 +1317,69 @@ def responder_com_busca(chat_id, termo, resultado):
     )
     try:
         resp = _chamar_groq([{"role": "user", "content": prompt}], max_tokens=400, temperature=0.7)
-        historico_chat.setdefault(chat_id, []).append({"role": "assistant", "content": resp})
+        with _HIST_LOCK:
+            historico_chat.setdefault(chat_id, []).append({"role": "assistant", "content": resp})
         _hist_salvar(chat_id, "assistant", resp)
         return resp
     except Exception:
         return f"🔍 Achei isso:\n{resultado[:600]}"
+
+
+def processar_mensagem_ia(chat_id, mensagem_usuario, on_busca=None):
+    """Pergunta pra IA e processa as tags especiais ([BUSCAR]/[LEMBRETE]/[TAREFA]/
+    [CONCLUIR]/[MEMORIA]) — usado tanto pelo Telegram quanto pela rota web /api/chat,
+    pra manter tarefas/lembretes/memórias unificados não importa a interface."""
+    resposta = perguntar_ia(chat_id, mensagem_usuario)
+
+    m_buscar = re.search(r'\[BUSCAR\s*:\s*(.+?)\]', resposta)
+    if m_buscar:
+        if on_busca:
+            on_busca()
+        termo = m_buscar.group(1).strip()
+        resultado = buscar_web(termo)
+        resposta = responder_com_busca(chat_id, termo, resultado)
+
+    match = re.search(r'\[LEMBRETE\s*:\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s*:\s*(.+?)\]', resposta)
+    if match:
+        try:
+            dt = datetime.strptime(f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H:%M")
+            texto_lembrete = match.group(3).strip()
+            adicionar_lembrete_usuario({
+                "tipo": "especifico",
+                "texto": texto_lembrete,
+                "datetime": dt.strftime("%Y-%m-%d %H:%M"),
+            })
+            resposta = re.sub(r'\[LEMBRETE[^\]]+\]', '', resposta).strip()
+        except Exception:
+            pass
+
+    m_tarefa = re.search(r'\[TAREFA\s*:\s*(.+?)\]', resposta)
+    if m_tarefa:
+        try:
+            adicionar_tarefa(m_tarefa.group(1).strip())
+            resposta = re.sub(r'\[TAREFA[^\]]*\]', '', resposta).strip()
+        except Exception:
+            pass
+
+    m_concluir = re.search(r'\[CONCLUIR\s*:\s*(.+?)\]', resposta)
+    if m_concluir:
+        try:
+            concluir_tarefa_por_texto(m_concluir.group(1).strip())
+            resposta = re.sub(r'\[CONCLUIR[^\]]*\]', '', resposta).strip()
+        except Exception:
+            pass
+
+    m_memoria = re.search(r'\[MEMORIA\s*:\s*(.+?)\]', resposta)
+    if m_memoria:
+        try:
+            adicionar_memoria(m_memoria.group(1).strip())
+            resposta = re.sub(r'\[MEMORIA[^\]]*\]', '', resposta).strip()
+        except Exception:
+            pass
+
+    if not resposta.strip():
+        resposta = "👍"
+    return resposta
 
 
 def gerar_registro_atendimento(notas):
@@ -1152,6 +1552,30 @@ def enviar_resumo_semanal():
     concluidas = [t for t in tarefas if t.get("concluida")]
     pendentes = [t for t in tarefas if not t.get("concluida")]
 
+    desde = (date.today() - timedelta(days=7)).isoformat()
+    saude_recente = [r for r in carregar_saude_diaria() if r.get("data", "") >= desde]
+    treino_recente = [h for h in carregar_treino_historico() if h.get("data", "") >= desde]
+
+    def _media(campo):
+        vals = [r[campo] for r in saude_recente if r.get(campo) is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    media_passos = _media("passos")
+    media_sono = _media("horas_sono")
+    media_fc = _media("fc_repouso")
+    treinos_semana = len(treino_recente)
+
+    linha_saude = ""
+    if any(v is not None for v in (media_passos, media_sono, media_fc)) or treinos_semana:
+        partes_saude = [f"{treinos_semana} treino(s)"]
+        if media_passos is not None:
+            partes_saude.append(f"média de {media_passos} passos/dia")
+        if media_sono is not None:
+            partes_saude.append(f"média de {media_sono}h de sono")
+        if media_fc is not None:
+            partes_saude.append(f"FC repouso média de {media_fc}bpm")
+        linha_saude = "Na semana: " + ", ".join(partes_saude) + ". "
+
     try:
         nomes_c = ", ".join(t["texto"] for t in concluidas[:5]) or "nenhuma"
         nomes_p = ", ".join(t["texto"] for t in pendentes[:5]) or "nenhuma"
@@ -1159,6 +1583,7 @@ def enviar_resumo_semanal():
             f"Você é o Orion. É sexta-feira, hora do resumo semanal do Bruno. "
             f"Concluídas: {len(concluidas)} ({nomes_c}). "
             f"Pendentes: {len(pendentes)} ({nomes_p}). "
+            f"{linha_saude}"
             f"Gere um resumo animado em até 5 linhas: reconheça as conquistas, "
             f"destaque o que ficou pendente e motive para a próxima semana."
         )
@@ -1167,8 +1592,9 @@ def enviar_resumo_semanal():
         mensagem = (
             f"📊 *Resumo da semana:*\n"
             f"✅ {len(concluidas)} tarefa(s) concluída(s)\n"
-            f"⬜ {len(pendentes)} pendente(s)\n\n"
-            "Bom fim de semana! 🎉"
+            f"⬜ {len(pendentes)} pendente(s)\n"
+            + (f"🏋️ {linha_saude}\n" if linha_saude else "")
+            + "\nBom fim de semana! 🎉"
         )
 
     try:
@@ -1673,7 +2099,10 @@ def registrar_handlers():
     @bot.callback_query_handler(func=lambda c: c.data.startswith("habito_"))
     def callback_habito(call):
         habito = call.data[len("habito_"):]
-        seq, msg_streak = confirmar_habito(habito)
+        if habito == "academia":
+            seq, msg_streak = registrar_treino_realizado(proximo_treino_sugerido(), fonte="manual")
+        else:
+            seq, msg_streak = confirmar_habito(habito)
 
         if habito == "agua":
             registrar_agua_log(fonte="lembrete")
@@ -1786,6 +2215,60 @@ def registrar_handlers():
             linhas.append(f"\nTendência: *{tend}*")
         bot.reply_to(msg, "\n".join(linhas), parse_mode="Markdown")
 
+    _SAUDE_FAKE_CAMPOS_NUM = {"passos": int, "calorias": int, "fc_repouso": int,
+                              "fc_media": int, "treino_duracao_min": int}
+
+    @bot.message_handler(commands=["saude_fake"])
+    def cmd_saude_fake(msg):
+        """Ferramenta de teste: injeta uma leitura de saúde sem precisar do relógio."""
+        texto = msg.text.replace("/saude_fake", "").strip()
+        if not texto:
+            bot.reply_to(msg,
+                "⚠️ Uso: `/saude_fake passos=8500 sono=7.2 fc_repouso=58 fc_media=95 treino=1 [data=AAAA-MM-DD]`",
+                parse_mode="Markdown")
+            return
+        campos = {}
+        data_override = None
+        for token in texto.split():
+            if "=" not in token:
+                continue
+            chave, valor = token.split("=", 1)
+            chave = chave.lower()
+            try:
+                if chave == "data":
+                    data_override = valor
+                elif chave == "sono":
+                    campos["horas_sono"] = float(valor)
+                elif chave == "treino":
+                    campos["treino_detectado"] = bool(int(valor))
+                elif chave in _SAUDE_FAKE_CAMPOS_NUM:
+                    campos[chave] = _SAUDE_FAKE_CAMPOS_NUM[chave](valor)
+                elif chave == "treino_tipo":
+                    campos["treino_tipo"] = valor
+            except ValueError:
+                continue
+        if not campos:
+            bot.reply_to(msg, "⚠️ Nenhum campo válido reconhecido.", parse_mode="Markdown")
+            return
+        registrar_saude_diaria(data=data_override, fonte="teste_manual", **campos)
+        bot.reply_to(msg, f"✅ Saúde registrada ({data_override or 'hoje'}): {campos}", parse_mode="Markdown")
+
+    @bot.message_handler(commands=["saude_hoje"])
+    def cmd_saude_hoje(msg):
+        registro = saude_hoje()
+        if not registro:
+            bot.reply_to(msg, "Nenhum dado de saúde registrado hoje. Use `/saude_fake` para testar.",
+                         parse_mode="Markdown")
+            return
+        linhas = ["🩺 *Saúde de hoje:*\n"]
+        for chave, label in (("passos", "🚶 Passos"), ("calorias", "🔥 Calorias"),
+                              ("horas_sono", "😴 Sono (h)"), ("fc_repouso", "❤️ FC repouso"),
+                              ("fc_media", "❤️ FC média"), ("treino_detectado", "🏋️ Treino detectado")):
+            if registro.get(chave) is not None:
+                linhas.append(f"{label}: *{registro[chave]}*")
+        linhas.append(f"\n_fonte: {registro.get('fonte', 'desconhecida')}_")
+        bot.reply_to(msg, "\n".join(linhas), parse_mode="Markdown")
+
     @bot.message_handler(commands=["stats"])
     def cmd_stats(msg):
         historico = carregar_historico_peso()
@@ -1806,15 +2289,25 @@ def registrar_handlers():
         else:
             linhas.append("⚖️ Peso: _não registrado — use /peso_")
 
-        # Treino de hoje
-        dia_letra, _ = treino_hoje()
-        linhas.append(f"🏋️ Hoje: *{_NOME_DIA.get(dia_letra, 'Descanso')}*")
+        # Treino sugerido (baseado no histórico real, não na agenda fixa)
+        dia_letra = proximo_treino_sugerido()
+        linhas.append(f"🏋️ Sugestão de hoje: *{_NOME_DIA.get(dia_letra, dia_letra)}*")
 
         # Streaks
         s_ac = streaks.get("academia", {}).get("sequencia", 0)
         s_ag = streaks.get("agua", {}).get("sequencia", 0)
         linhas.append(f"🔥 Sequência academia: *{s_ac} dia(s)*")
         linhas.append(f"💧 Sequência hidratação: *{s_ag} dia(s)*")
+
+        # Saúde do dia (relógio)
+        registro_saude = saude_hoje()
+        if registro_saude:
+            if registro_saude.get("passos") is not None:
+                linhas.append(f"🚶 Passos hoje: *{registro_saude['passos']}*")
+            if registro_saude.get("horas_sono") is not None:
+                linhas.append(f"😴 Sono: *{registro_saude['horas_sono']}h*")
+            if registro_saude.get("fc_repouso") is not None:
+                linhas.append(f"❤️ FC repouso: *{registro_saude['fc_repouso']}bpm*")
 
         # Tarefas
         pendentes = [t for t in tarefas if not t.get("concluida")]
@@ -1833,15 +2326,19 @@ def registrar_handlers():
         bot.send_chat_action(msg.chat.id, "typing")
         historico = carregar_historico_peso()
         streaks = carregar_streaks()
-        dia_letra, exercicios = treino_hoje()
+        dia_letra = proximo_treino_sugerido()
         p = float(historico[-1]["peso"]) if historico else None
         tend = tendencia_peso(historico) if historico else None
         s_ac = streaks.get("academia", {}).get("sequencia", 0)
+        registro_saude = saude_hoje() or {}
 
         prompt = (
             f"Você é o Orion, personal trainer e assistente do Bruno. "
             f"Dados: peso {p}kg, tendência {tend}, sequência academia {s_ac} dias. "
-            f"Treino de hoje: {_NOME_DIA.get(dia_letra, 'Descanso')}. "
+            f"Treino sugerido de hoje: {_NOME_DIA.get(dia_letra, dia_letra)}. "
+            f"Sono: {registro_saude.get('horas_sono', 'sem dado')}h. "
+            f"FC repouso: {registro_saude.get('fc_repouso', 'sem dado')}bpm. "
+            f"Passos hoje: {registro_saude.get('passos', 'sem dado')}. "
             f"Dê 3 dicas práticas e personalizadas de treino, nutrição ou recuperação. "
             f"Seja direto, use linguagem informal, máximo 6 linhas no total."
         )
@@ -1904,7 +2401,8 @@ def registrar_handlers():
             exercicios = carregar_treino_dia(arg)
             bot.reply_to(msg, formatar_treino(arg, exercicios), parse_mode="Markdown")
         else:
-            dia_letra, exercicios = treino_hoje()
+            dia_letra = proximo_treino_sugerido()
+            exercicios = carregar_treino_dia(dia_letra) if dia_letra != 'Descanso' else []
             dias_semana = ['segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado', 'domingo']
             hoje_nome = dias_semana[datetime.now(FUSO).weekday()]
             texto = formatar_treino(dia_letra, exercicios)
@@ -1940,6 +2438,50 @@ def registrar_handlers():
             bot.reply_to(msg,
                 "⚠️ Formato: `/add_exercicio A Peito Supino reto 4 6-8`",
                 parse_mode="Markdown")
+
+    _DIAS_SEMANA_ABREV = {"seg": 0, "ter": 1, "qua": 2, "qui": 3, "sex": 4, "sab": 5, "sáb": 5, "dom": 6}
+
+    @bot.message_handler(commands=["definir_agenda"])
+    def cmd_definir_agenda(msg):
+        partes = msg.text.replace("/definir_agenda", "").strip().split()
+        if len(partes) != 2:
+            bot.reply_to(msg,
+                "⚠️ Uso: `/definir_agenda seg A`\n"
+                "Dias: seg, ter, qua, qui, sex, sab, dom. Letra: A, B, C ou Descanso.",
+                parse_mode="Markdown")
+            return
+        dia_abrev, dia_letra = partes[0].lower(), partes[1].upper()
+        dia_semana = _DIAS_SEMANA_ABREV.get(dia_abrev)
+        if dia_semana is None or dia_letra not in ('A', 'B', 'C', 'DESCANSO'):
+            bot.reply_to(msg,
+                "⚠️ Uso: `/definir_agenda seg A`\n"
+                "Dias: seg, ter, qua, qui, sex, sab, dom. Letra: A, B, C ou Descanso.",
+                parse_mode="Markdown")
+            return
+        dia_letra = dia_letra.capitalize() if dia_letra == 'DESCANSO' else dia_letra
+        dados = {"dia_semana": dia_semana, "dia_letra": dia_letra}
+        if _USA_SB:
+            try:
+                existente = _sb_req("GET", "agenda_treino", {"dia_semana": f"eq.{dia_semana}", "select": "id"})
+                if existente:
+                    _sb_req("PATCH", "agenda_treino", {"dia_semana": f"eq.{dia_semana}"}, dados)
+                else:
+                    _sb_req("POST", "agenda_treino", body=dados)
+            except Exception as e:
+                bot.reply_to(msg, f"⚠️ Não consegui salvar no banco: {e}", parse_mode="Markdown")
+                return
+        nomes_dia = ['segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado', 'domingo']
+        bot.reply_to(msg, f"✅ Agenda atualizada: *{nomes_dia[dia_semana]}* → *{dia_letra}*",
+                     parse_mode="Markdown")
+
+    @bot.message_handler(commands=["ver_agenda"])
+    def cmd_ver_agenda(msg):
+        agenda = carregar_agenda_treino()
+        nomes_dia = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
+        linhas = ["📅 *Agenda de treino:*\n"]
+        for i, nome in enumerate(nomes_dia):
+            linhas.append(f"{nome}: *{agenda.get(i, 'Descanso')}*")
+        bot.reply_to(msg, "\n".join(linhas), parse_mode="Markdown")
 
     @bot.message_handler(commands=["buscar"])
     def cmd_buscar(msg):
@@ -1992,6 +2534,7 @@ def registrar_handlers():
             config["telegram"]["chat_id"] = str(chat_id)
             salvar_config()
         estado = estados.get(chat_id, {})
+        override_treino = detectar_override_treino(msg.text) if not estado.get("step") else None
 
         if estado.get("step") == "data":
             try:
@@ -2038,58 +2581,19 @@ def registrar_handlers():
             bot.send_chat_action(chat_id, "typing")
             enviar_registro(chat_id, msg.text)
 
+        elif override_treino:
+            exercicios = carregar_treino_dia(override_treino)
+            registrar_treino_realizado(override_treino, fonte="chat")
+            bot.reply_to(msg,
+                         f"💪 Beleza, marcado *{_NOME_DIA.get(override_treino, override_treino)}* hoje!\n\n"
+                         + formatar_treino(override_treino, exercicios),
+                         parse_mode="Markdown")
+
         else:
             bot.send_chat_action(chat_id, "typing")
-            resposta = perguntar_ia(chat_id, msg.text)
-
-            m_buscar = re.search(r'\[BUSCAR\s*:\s*(.+?)\]', resposta)
-            if m_buscar:
-                termo = m_buscar.group(1).strip()
-                bot.send_chat_action(chat_id, "typing")
-                resultado = buscar_web(termo)
-                resposta = responder_com_busca(chat_id, termo, resultado)
-
-            match = re.search(r'\[LEMBRETE\s*:\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s*:\s*(.+?)\]', resposta)
-            if match:
-                try:
-                    dt = datetime.strptime(f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H:%M")
-                    texto_lembrete = match.group(3).strip()
-                    adicionar_lembrete_usuario({
-                        "tipo": "especifico",
-                        "texto": texto_lembrete,
-                        "datetime": dt.strftime("%Y-%m-%d %H:%M"),
-                    })
-                    resposta = re.sub(r'\[LEMBRETE[^\]]+\]', '', resposta).strip()
-                except Exception:
-                    pass
-
-            m_tarefa = re.search(r'\[TAREFA\s*:\s*(.+?)\]', resposta)
-            if m_tarefa:
-                try:
-                    adicionar_tarefa(m_tarefa.group(1).strip())
-                    resposta = re.sub(r'\[TAREFA[^\]]*\]', '', resposta).strip()
-                except Exception:
-                    pass
-
-            m_concluir = re.search(r'\[CONCLUIR\s*:\s*(.+?)\]', resposta)
-            if m_concluir:
-                try:
-                    concluir_tarefa_por_texto(m_concluir.group(1).strip())
-                    resposta = re.sub(r'\[CONCLUIR[^\]]*\]', '', resposta).strip()
-                except Exception:
-                    pass
-
-            m_memoria = re.search(r'\[MEMORIA\s*:\s*(.+?)\]', resposta)
-            if m_memoria:
-                try:
-                    adicionar_memoria(m_memoria.group(1).strip())
-                    resposta = re.sub(r'\[MEMORIA[^\]]*\]', '', resposta).strip()
-                except Exception:
-                    pass
-
-            if not resposta.strip():
-                resposta = "👍"
-
+            resposta = processar_mensagem_ia(
+                chat_id, msg.text,
+                on_busca=lambda: bot.send_chat_action(chat_id, "typing"))
             bot.reply_to(msg, resposta)
 
 
@@ -2119,6 +2623,17 @@ def main():
         print("\n⚠️  Persistência: arquivos locais (dados perdidos ao reiniciar)")
 
     bot = telebot.TeleBot(token)
+    orion_servidor.iniciar_control_server()
+    orion_servidor.registrar_comandos(bot)
+    orion_servidor.registrar_resumo_provider(montar_resumo_dashboard)
+    orion_servidor.registrar_chat_provider(
+        lambda msg: processar_mensagem_ia(int(config["telegram"]["chat_id"]), msg))
+    orion_servidor.registrar_health_export_provider(processar_export_apple_health)
+    orion_servidor.registrar_historico_provider(
+        lambda: _hist_carregar_db(int(config["telegram"]["chat_id"])))
+    orion_servidor.registrar_lembretes_provider(
+        carregar_lembretes_usuario, criar_lembrete_web, remover_lembrete_por_id,
+        lambda: config.get("lembretes", []))
     registrar_handlers()
     configurar_agenda()
 

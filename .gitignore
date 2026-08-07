@@ -1,6 +1,19 @@
 config.json
+.env
 tarefas.json
 *.vbs
 *.bat
 __pycache__/
 lembrete.py
+
+# Fallback local dos domínios de dados (só existem quando SUPABASE_URL/KEY não
+# estão configurados) — podem conter dados pessoais de saúde reais, nunca comitar.
+saude_diaria.json
+treino_historico.json
+streaks.json
+peso_historico.json
+agua_log.json
+exportar.zip
+export.zip
+export.xml
+exportar.xml
